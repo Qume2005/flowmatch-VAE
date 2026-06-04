@@ -20,7 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision.datasets import CelebA
 
 from flowmatch_vae.config import Config
-from flowmatch_vae.data.celeba import get_transforms
+from flowmatch_vae.data.celeba import get_transforms, _ImageOnly
 from flowmatch_vae.models.vae import FlowMatchVAE
 
 
@@ -44,8 +44,8 @@ def train_func(config: dict):
     # ---- Data ----
     transform = get_transforms(tc.image_size)
 
-    dataset = CelebA(root=tc.data_path, split="train", target_type=["attr"],
-                     transform=transform, download=False)
+    dataset = _ImageOnly(CelebA(root=tc.data_path, split="train", target_type=["attr"],
+                                transform=transform, download=False))
 
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank,
