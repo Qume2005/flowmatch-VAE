@@ -145,3 +145,115 @@ class AttnPool2x2(nn.Module):
         # Weighted sum
         out = (weights * x_blocks).sum(dim=-2)  # (B, H//2, W//2, C)
         return out.permute(0, 3, 1, 2)  # (B, C, H//2, W//2)
+
+
+# ---------------------------------------------------------------------------
+# 2D Rotary Position Embedding
+# ---------------------------------------------------------------------------
+
+def apply_2d_rope(
+    q: torch.Tensor,
+    y_pos: torch.Tensor,
+    x_pos: torch.Tensor,
+) -> torch.Tensor:
+    """Apply 2D RoPE to a (B, N, H, D) tensor.
+
+    First D/2 dimensions get y-position rotation.
+    Last D/2 dimensions get x-position rotation.
+
+    Args:
+        q: (B, N, H, D) query or key tensor.
+        y_pos: (N,) y-coordinate per token.
+        x_pos: (N,) x-coordinate per token.
+
+    Returns:
+        (B, N, H, D) with rotations applied.
+    """
+    B, N, H, D = q.shape
+    half = D // 2
+    quarter = half // 2
+
+    # Base frequencies: 1 / (10000^(2i/d))
+    freqs = 1.0 / (
+        10000 ** (torch.arange(0, quarter, device=q.device, dtype=q.dtype) / quarter)
+    )
+
+    # --- Y rotation (first half of D) ---
+    angles_y = y_pos.to(device=q.device, dtype=q.dtype)[:, None] * freqs[None, :]  # (N, quarter)
+    cos_y = angles_y.cos()[None, :, None, :]  # (1, N, 1, quarter)
+    sin_y = angles_y.sin()[None, :, None, :]
+
+    q_y = q[..., :half].reshape(B, N, H, quarter, 2)
+    q_y0 = q_y[..., 0]  # (B, N, H, quarter)
+    q_y1 = q_y[..., 1]
+    new_y0 = q_y0 * cos_y - q_y1 * sin_y
+    new_y1 = q_y0 * sin_y + q_y1 * cos_y
+    q_y_rot = torch.stack([new_y0, new_y1], dim=-1).reshape(B, N, H, half)
+
+    # --- X rotation (second half of D) ---
+    angles_x = x_pos.to(device=q.device, dtype=q.dtype)[:, None] * freqs[None, :]  # (N, quarter)
+    cos_x = angles_x.cos()[None, :, None, :]  # (1, N, 1, quarter)
+    sin_x = angles_x.sin()[None, :, None, :]
+
+    q_x = q[..., half:].reshape(B, N, H, quarter, 2)
+    q_x0 = q_x[..., 0]
+    q_x1 = q_x[..., 1]
+    new_x0 = q_x0 * cos_x - q_x1 * sin_x
+    new_x1 = q_x0 * sin_x + q_x1 * cos_x
+    q_x_rot = torch.stack([new_x0, new_x1], dim=-1).reshape(B, N, H, half)
+
+    return torch.cat([q_y_rot, q_x_rot], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# FusionAttention — linear self-attention with 2D RoPE
+# ---------------------------------------------------------------------------
+
+class FusionAttention(nn.Module):
+    """Bidirectional linear attention with 2D RoPE for multi-scale fusion.
+
+    Simple linear attention (no DW conv, no forget gate) — O(N*d^2) complexity
+    suitable for fusing ~1365 multi-scale tokens.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        y_pos: torch.Tensor,
+        x_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        x: (B, N, C)   y_pos: (N,)   x_pos: (N,)
+        Returns: (B, N, C)
+        """
+        B, N, C = x.shape
+        H, D = self.num_heads, self.head_dim
+
+        q = self.q_proj(x).view(B, N, H, D)
+        k = self.k_proj(x).view(B, N, H, D)
+        v = self.v_proj(x).view(B, N, H, D)
+
+        q = apply_2d_rope(q, y_pos, x_pos)
+        k = apply_2d_rope(k, y_pos, x_pos)
+
+        # L2 normalise
+        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
+        k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
+
+        # Bidirectional linear attention: S = K^T V,  O = Q S
+        S = torch.einsum("bthd,bthe->bhde", k, v)   # (B, H, D, D)
+        o = torch.einsum("bnhd,bhde->bnhe", q, S)    # (B, H, N, D)
+
+        # Normalise per head
+        o = o / (o.norm(dim=-1, keepdim=True) + 1e-6) * (D ** 0.5)
+        return self.out_proj(o.reshape(B, N, C))

@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from flowmatch_vae.config import Config
 from flowmatch_vae.models.vae import FlowMatchVAE
-from flowmatch_vae.models.conv_encoder import SwiGLUConv, RMSNorm2d, AttnPool2x2
+from flowmatch_vae.models.conv_encoder import SwiGLUConv, RMSNorm2d, AttnPool2x2, apply_2d_rope, FusionAttention
 
 
 def test_rmsnorm2d():
@@ -71,3 +71,32 @@ def test_attn_pool_grad_flows():
     out.sum().backward()
     assert x.grad is not None
     assert x.grad.shape == x.shape
+
+
+def test_2d_rope_shape():
+    """2D RoPE preserves tensor shape."""
+    B, N, H, D = 2, 16, 4, 32
+    q = torch.randn(B, N, H, D)
+    y_pos = torch.arange(N, dtype=torch.float)
+    x_pos = torch.arange(N, dtype=torch.float)
+    out = apply_2d_rope(q, y_pos, x_pos)
+    assert out.shape == (B, N, H, D)
+
+
+def test_2d_rope_rotation():
+    """RoPE at position 0 is identity (cos=1, sin=0)."""
+    B, N, H, D = 1, 4, 2, 8
+    q = torch.randn(B, N, H, D)
+    zero_pos = torch.zeros(N)
+    out = apply_2d_rope(q, zero_pos, zero_pos)
+    assert torch.allclose(out, q, atol=1e-5)
+
+
+def test_fusion_attention_shape():
+    """FusionAttention preserves sequence length."""
+    attn = FusionAttention(dim=64, num_heads=4)
+    B, N, C = 2, 100, 64
+    y_pos = torch.arange(N, dtype=torch.float)
+    x_pos = torch.arange(N, dtype=torch.float)
+    out = attn(torch.randn(B, N, C), y_pos, x_pos)
+    assert out.shape == (B, N, C)
