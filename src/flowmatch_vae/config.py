@@ -22,7 +22,7 @@ class DecoderConfig:
     out_channels: int = 3
     patch_size: int = 4
     embed_dim: int = 256
-    depth: int = 6
+    depth: int = 12
     num_heads: int = 8
     window_size: int = 4
     mlp_ratio: float = 4.0
@@ -37,8 +37,8 @@ class TrainConfig:
     epochs: int = 200
     lr: float = 1e-4
     weight_decay: float = 0.01
-    kl_weight: float = 0.1
-    kl_warmup_epochs: int = 10
+    kl_weight: float = 0.001
+    kl_warmup_epochs: int = 50
     num_sample_steps: int = 8
     image_size: int = 64
     data_path: str = "./data"

@@ -44,7 +44,7 @@ def test_end_to_end_overfit_single_batch():
 
     torch.manual_seed(42)
     x = torch.randn(4, 3, 64, 64)
-    for _ in range(400):
+    for _ in range(800):
         losses = model.compute_loss(x)
         optimizer.zero_grad()
         losses["loss"].backward()

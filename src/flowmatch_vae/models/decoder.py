@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from flowmatch_vae.config import DecoderConfig
-from flowmatch_vae.models.swin import PatchEmbed, AdaLNSwinBlock
+from flowmatch_vae.models.swin import PatchEmbed, CrossAttnAdaLNSwinBlock
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -60,7 +60,7 @@ class FlowDecoder(nn.Module):
         self.z_upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
         self.blocks = nn.ModuleList([
-            AdaLNSwinBlock(
+            CrossAttnAdaLNSwinBlock(
                 dim=cfg.embed_dim,
                 num_heads=cfg.num_heads,
                 window_size=cfg.window_size,
@@ -92,12 +92,10 @@ class FlowDecoder(nn.Module):
         z_proj = self.z_upsample(z_proj)       # (B, embed_dim, 16, 16)
         z_proj = z_proj.permute(0, 2, 3, 1)   # (B, 16, 16, embed_dim)
 
-        h = h + z_proj
-
         t_emb = self.time_embed(t)  # (B, embed_dim)
 
         for block in self.blocks:
-            h = block(h, t_emb)
+            h = block(h, t_emb, z_proj)
 
         h = self.out_norm(h)
         h = self.out_proj(h)  # (B, 16, 16, ps^2 * out_channels)

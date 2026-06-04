@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flowmatch_vae.models.swin import (
+    CrossAttnAdaLNSwinBlock,
     PatchEmbed,
     PatchMerge,
     WindowAttention,
@@ -71,4 +72,22 @@ class TestAdaLNSwinBlock:
         x = torch.randn(2, 16, 16, 256)
         cond = torch.randn(2, 256)
         out = block(x, cond)
+        assert out.shape == (2, 16, 16, 256)
+
+
+class TestCrossAttnAdaLNSwinBlock:
+    def test_shape(self):
+        block = CrossAttnAdaLNSwinBlock(dim=256, num_heads=8, window_size=4, shift_size=0)
+        x = torch.randn(2, 16, 16, 256)
+        cond = torch.randn(2, 256)
+        z_tokens = torch.randn(2, 16, 16, 256)
+        out = block(x, cond, z_tokens)
+        assert out.shape == (2, 16, 16, 256)
+
+    def test_shifted(self):
+        block = CrossAttnAdaLNSwinBlock(dim=256, num_heads=8, window_size=4, shift_size=2)
+        x = torch.randn(2, 16, 16, 256)
+        cond = torch.randn(2, 256)
+        z_tokens = torch.randn(2, 16, 16, 256)
+        out = block(x, cond, z_tokens)
         assert out.shape == (2, 16, 16, 256)
