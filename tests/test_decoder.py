@@ -4,8 +4,8 @@ from flowmatch_vae.models.decoder import FlowDecoder
 
 
 def test_decoder_output_shape():
-    cfg = Config().decoder
-    decoder = FlowDecoder(cfg)
+    cfg = Config()
+    decoder = FlowDecoder(cfg.decoder, mhc_cfg=cfg.mhc)
     x_t = torch.randn(4, 3, 64, 64)
     t = torch.rand(4)
     z = torch.randn(4, 8, 8, 256)
@@ -14,8 +14,8 @@ def test_decoder_output_shape():
 
 
 def test_decoder_gradient_flows():
-    cfg = Config().decoder
-    decoder = FlowDecoder(cfg)
+    cfg = Config()
+    decoder = FlowDecoder(cfg.decoder, mhc_cfg=cfg.mhc)
     x_t = torch.randn(2, 3, 64, 64)
     t = torch.rand(2)
     z = torch.randn(2, 8, 8, 256)

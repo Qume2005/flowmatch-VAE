@@ -15,8 +15,8 @@ class FlowMatchVAE(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-        self.encoder = SwinEncoder(cfg.encoder)
-        self.decoder = FlowDecoder(cfg.decoder)
+        self.encoder = SwinEncoder(cfg.encoder, mhc_cfg=cfg.mhc)
+        self.decoder = FlowDecoder(cfg.decoder, mhc_cfg=cfg.mhc)
 
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """x: (B, 3, 64, 64) -> μ, logvar"""

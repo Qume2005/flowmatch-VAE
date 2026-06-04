@@ -5,7 +5,10 @@ from flowmatch_vae.models.swin import (
     CrossAttnAdaLNSwinBlock,
     PatchEmbed,
     PatchMerge,
-    WindowAttention,
+    KimiLinearAttention,
+    KimiLinearCrossAttention,
+    SwiGLUFFN,
+    mHCConnection,
     SwinBlock,
     AdaLNSwinBlock,
     window_partition,
@@ -27,13 +30,43 @@ class TestWindowPartitionReverse:
         assert windows.shape == (16, 4, 4, 128)
 
 
-class TestWindowAttention:
+class TestKimiLinearAttention:
     def test_shape(self):
         dim, num_heads, ws = 128, 4, 4
-        attn = WindowAttention(dim=dim, num_heads=num_heads, window_size=ws)
+        attn = KimiLinearAttention(dim=dim, num_heads=num_heads, window_size=ws)
         x = torch.randn(8, ws * ws, dim)
         out = attn(x)
         assert out.shape == (8, ws * ws, dim)
+
+
+class TestKimiLinearCrossAttention:
+    def test_shape(self):
+        dim, num_heads = 128, 4
+        cross = KimiLinearCrossAttention(dim=dim, num_heads=num_heads)
+        x = torch.randn(2, 16, dim)
+        z = torch.randn(2, 64, dim)
+        out = cross(x, z)
+        assert out.shape == (2, 16, dim)
+
+
+class TestSwiGLUFFN:
+    def test_shape(self):
+        ffn = SwiGLUFFN(dim=128)
+        x = torch.randn(2, 16, 128)
+        out = ffn(x)
+        assert out.shape == (2, 16, 128)
+
+
+class TestmHCConnection:
+    def test_read_write_roundtrip(self):
+        dim, n = 64, 4
+        mhc = mHCConnection(dim=dim, expansion_rate=n)
+        x_stream = torch.randn(2, 8, 8, n * dim)
+        layer_input, ctx = mhc.read(x_stream)
+        assert layer_input.shape == (2, 8, 8, dim)
+        sublayer_out = torch.randn(2, 8, 8, dim)
+        new_stream = mhc.write(x_stream, sublayer_out, ctx)
+        assert new_stream.shape == (2, 8, 8, n * dim)
 
 
 class TestPatchEmbed:

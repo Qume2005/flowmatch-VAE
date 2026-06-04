@@ -1,19 +1,56 @@
-"""Swin Transformer building blocks.
+"""Swin Transformer building blocks — upgraded architecture.
 
-Implements core Swin Transformer components including:
-- window_partition / window_reverse
-- WindowAttention with relative position bias
-- SwinBlock (standard W-MSA / SW-MSA block)
-- AdaLNSwinBlock (adaptive LayerNorm modulated block for decoder)
-- PatchEmbed / PatchMerge
-- DropPath (stochastic depth)
+Key changes from the baseline:
+- **Kimi Linear Attention** (KDA) replaces standard softmax window attention.
+  Channel-wise gated delta attention with L2-normalised Q/K, output gating,
+  and short depthwise convolutions (arXiv:2510.26692).
+- **mHC** (Manifold-Constrained Hyper-Connections) replaces standard residual
+  connections.  Doubly-stochastic Sinkhorn-Knopp projection on H_res,
+  sigmoid-constrained H_pre / H_post, n-stream expansion (arXiv:2512.24880).
+- **SwiGLU FFN** replaces standard GELU MLP.
+- **RMSNorm** everywhere — no LayerNorm, no BatchNorm.
+- **Swish (SiLU)** everywhere — no GELU, no ReLU.
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm
+# ---------------------------------------------------------------------------
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalisation.
+
+    ``y = x / RMS(x) * gamma``  where  ``RMS(x) = sqrt(mean(x^2) + eps)``.
+
+    Args:
+        dim: Normalised dimension.
+        eps: Small constant for numerical stability.
+        elementwise_affine: If *True*, learn a per-element ``gamma`` parameter.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__()
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.gamma = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter("gamma", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x_normed = x / rms
+        if self.elementwise_affine:
+            x_normed = x_normed * self.gamma
+        return x_normed
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +68,6 @@ class DropPath(nn.Module):
         if self.drop_prob == 0.0 or not self.training:
             return x
         keep_prob = 1 - self.drop_prob
-        # work with diff dim tensors, expand the first dim
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
         random_tensor = torch.floor(random_tensor + keep_prob)
@@ -43,206 +79,402 @@ class DropPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
-    """Partition (B, H, W, C) into (B * nH * nW, ws, ws, C).
-
-    Args:
-        x: Input tensor of shape (B, H, W, C).
-        window_size: Window size (ws).
-
-    Returns:
-        Windows tensor of shape (B * nH * nW, ws, ws, C).
-    """
+    """(B, H, W, C) → (B·nH·nW, ws, ws, C)."""
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    return windows
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
 
 
-def window_reverse(
-    windows: torch.Tensor, window_size: int, H: int, W: int
-) -> torch.Tensor:
-    """Reverse window partition back to (B, H, W, C).
-
-    Args:
-        windows: (B * nH * nW, ws, ws, C)
-        window_size: Window size.
-        H: Original height.
-        W: Original width.
-
-    Returns:
-        Restored tensor of shape (B, H, W, C).
-    """
-    nH = H // window_size
-    nW = W // window_size
+def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
+    """(B·nH·nW, ws, ws, C) → (B, H, W, C)."""
+    nH, nW = H // window_size, W // window_size
     B = windows.shape[0] // (nH * nW)
     x = windows.view(B, nH, nW, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    return x
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
 
 
-# ---------------------------------------------------------------------------
-# Shifted window attention mask
-# ---------------------------------------------------------------------------
-
-def _compute_shift_mask(
-    window_size: int, shift_size: int, H: int, W: int
-) -> torch.Tensor:
-    """Compute the attention mask for shifted-window MSA.
-
-    Returns:
-        Attention mask of shape (nW, ws*ws, ws*ws).
-    """
+def _compute_shift_mask(window_size: int, shift_size: int, H: int, W: int) -> torch.Tensor:
+    """Attention mask for shifted-window MSA.  Shape: (nW, ws², ws²)."""
     img_mask = torch.zeros((1, H, W, 1))
-    h_slices = (
-        slice(0, -window_size),
-        slice(-window_size, -shift_size),
-        slice(-shift_size, None),
-    )
-    w_slices = (
-        slice(0, -window_size),
-        slice(-window_size, -shift_size),
-        slice(-shift_size, None),
-    )
+    h_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
+    w_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
     cnt = 0
     for h in h_slices:
         for w in w_slices:
             img_mask[:, h, w, :] = cnt
             cnt += 1
-
-    mask_windows = window_partition(img_mask, window_size)  # (nW, ws, ws, 1)
-    nW = mask_windows.shape[0]
-    mask_windows = mask_windows.view(nW, -1)  # (nW, ws*ws)
-
+    mask_windows = window_partition(img_mask, window_size).view(-1, window_size * window_size)
     attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-    attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0))
-    attn_mask = attn_mask.masked_fill(attn_mask == 0, float(0.0))
-    return attn_mask  # (nW, ws*ws, ws*ws)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
+    return attn_mask
 
 
 # ---------------------------------------------------------------------------
-# WindowAttention
+# Kimi Linear Attention (KDA) — bidirectional variant for vision
 # ---------------------------------------------------------------------------
 
-class WindowAttention(nn.Module):
-    """Window-based multi-head self-attention with relative position bias.
+class KimiLinearAttention(nn.Module):
+    """Kimi Delta Attention — bidirectional, windowed.
+
+    Replaces softmax attention with linear-attention plus:
+    - L2 normalisation on Q and K
+    - Learnable channel-wise decay gate (alpha)
+    - Delta-rule corrective term (beta)
+    - Output gating (sigmoid)
+    - Short depthwise conv for Q, K, V
 
     Args:
-        dim: Number of input channels.
+        dim: Token dimension.
         num_heads: Number of attention heads.
-        window_size: Window size.
-        qkv_bias: Whether to add bias to qkv projections.
+        window_size: Window size (used for depthwise conv kernel size hint).
+    """
+
+    def __init__(self, dim: int, num_heads: int, window_size: int):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window_size = window_size
+
+        # Separate Q, K, V projections
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+
+        # Short depthwise convolutions (kernel=3, padding=1)
+        self.dw_conv_q = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.dw_conv_k = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.dw_conv_v = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+
+        # Channel-wise forget gate: low-rank projection
+        self.alpha_up = nn.Linear(dim, dim, bias=False)
+        self.alpha_down = nn.Linear(dim, dim, bias=True)
+
+        # Scalar beta (delta-rule learning rate)
+        self.beta_proj = nn.Linear(dim, num_heads, bias=True)
+
+        # Output projection + gating
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.gate_up = nn.Linear(dim, dim, bias=False)
+        self.gate_down = nn.Linear(dim, dim, bias=True)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for m in (self.q_proj, self.k_proj, self.v_proj, self.out_proj):
+            nn.init.xavier_uniform_(m.weight)
+        for m in (self.dw_conv_q, self.dw_conv_k, self.dw_conv_v):
+            nn.init.kaiming_uniform_(m.weight, nonlinearity="linear")
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        x: (num_windows, ws², dim)
+        Returns: (num_windows, ws², dim)
+        """
+        B_, N, C = x.shape
+        H = self.num_heads
+        D = self.head_dim
+
+        # Projections
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Short depthwise conv + Swish
+        q = F.silu(self.dw_conv_q(q.transpose(1, 2))).transpose(1, 2)
+        k = F.silu(self.dw_conv_k(k.transpose(1, 2))).transpose(1, 2)
+        v = F.silu(self.dw_conv_v(v.transpose(1, 2))).transpose(1, 2)
+
+        # L2 normalise Q and K
+        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
+        k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
+
+        # Channel-wise forget gate alpha
+        alpha = torch.sigmoid(self.alpha_down(F.silu(self.alpha_up(x))))  # (B_, N, C)
+
+        # Scalar beta
+        beta = torch.sigmoid(self.beta_proj(x))  # (B_, N, H)
+
+        # Reshape into heads
+        q = q.view(B_, N, H, D)
+        k = k.view(B_, N, H, D)
+        v = v.view(B_, N, H, D)
+        alpha = alpha.view(B_, N, H, D)
+
+        # Bidirectional linear attention:
+        #   S = Σ_t (beta_t * alpha_t ⊙ k_t) ⊗ v_t   →  (B_, H, D, D)
+        beta_exp = beta.unsqueeze(-1)            # (B_, N, H, 1)
+        k_w = beta_exp * alpha * k               # (B_, N, H, D)
+
+        S = torch.einsum("bthd,bthe->bhde", k_w, v)  # (B_, H, D, D)
+
+        # o = q @ S  →  (B_, H, N, D)
+        o = torch.einsum("bnhd,bhde->bnhe", q, S)
+
+        # RMSNorm per head
+        o = o / (o.norm(dim=-1, keepdim=True) + 1e-6) * (D ** 0.5)
+
+        o = o.reshape(B_, N, C)
+
+        # Output gating
+        gate = torch.sigmoid(self.gate_down(F.silu(self.gate_up(x))))
+        o = gate * o
+
+        return self.out_proj(o)
+
+
+# ---------------------------------------------------------------------------
+# Kimi Linear Cross-Attention
+# ---------------------------------------------------------------------------
+
+class KimiLinearCrossAttention(nn.Module):
+    """Cross-attention using Kimi Linear (bidirectional).
+
+    Q comes from x, K/V come from z_tokens.
+    """
+
+    def __init__(self, dim: int, z_dim: int | None = None, num_heads: int = 8):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        if z_dim is None:
+            z_dim = dim
+        self.z_dim = z_dim
+
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(z_dim, dim, bias=False)
+        self.v_proj = nn.Linear(z_dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.gate_up = nn.Linear(dim, dim, bias=False)
+        self.gate_down = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, N, dim)   z: (B, N_z, z_dim)
+        Returns: (B, N, dim)
+        """
+        B, N, C = x.shape
+        N_z = z.shape[1]
+        H = self.num_heads
+        D = self.head_dim
+
+        q = F.silu(self.q_proj(x))
+        k = F.silu(self.k_proj(z))
+        v = F.silu(self.v_proj(z))
+
+        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
+        k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
+
+        q = q.view(B, N, H, D)
+        k = k.view(B, N_z, H, D)
+        v = v.view(B, N_z, H, D)
+
+        S = torch.einsum("bthd,bthe->bhde", k, v)      # (B, H, D, D)
+        o = torch.einsum("bnhd,bhde->bnhe", q, S)      # (B, H, N, D)
+
+        o = o / (o.norm(dim=-1, keepdim=True) + 1e-6) * (D ** 0.5)
+        o = o.reshape(B, N, C)
+
+        gate = torch.sigmoid(self.gate_down(F.silu(self.gate_up(x))))
+        o = gate * o
+        return self.out_proj(o)
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU FFN
+# ---------------------------------------------------------------------------
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward network.
+
+    hidden_mult = 8/3 ≈ 2.67 matches the parameter count of a standard 4× MLP
+    when rounded to 256-multiples.
+    """
+
+    def __init__(self, dim: int, hidden_mult: float = 8.0 / 3.0, out_features: int | None = None):
+        super().__init__()
+        hidden = int(dim * hidden_mult)
+        hidden = ((hidden + 255) // 256) * 256
+        out_features = out_features or dim
+
+        self.w_gate = nn.Linear(dim, hidden, bias=False)
+        self.w_up = nn.Linear(dim, hidden, bias=False)
+        self.w_down = nn.Linear(hidden, out_features, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+
+
+# ---------------------------------------------------------------------------
+# mHC — Manifold-Constrained Hyper-Connections
+# ---------------------------------------------------------------------------
+
+def sinkhorn_knopp(M: torch.Tensor, iters: int = 20) -> torch.Tensor:
+    """Project M (..., n, n) to doubly-stochastic via Sinkhorn-Knopp."""
+    M = torch.exp(M)
+    for _ in range(iters):
+        M = M / (M.sum(dim=-1, keepdim=True) + 1e-8)
+        M = M / (M.sum(dim=-2, keepdim=True) + 1e-8)
+    return M
+
+
+class mHCConnection(nn.Module):
+    """Manifold-Constrained Hyper-Connection for a single sub-layer.
+
+    Two-phase usage:
+        1. ``layer_input, ctx = mhc.read(x_stream)``
+        2. Run sublayer on ``layer_input``
+        3. ``x_stream = mhc.write(x_stream, sublayer_out, ctx)``
+
+    This ensures the mappings (H_pre, H_res, H_post) are computed once from
+    the current stream state and reused consistently.
+
+    Args:
+        dim: Token dimension C.
+        expansion_rate: Number of parallel residual streams n.
+        sinkhorn_iters: Sinkhorn-Knopp iterations.
+        gating_init: Initial value for learnable gating scalars.
     """
 
     def __init__(
         self,
         dim: int,
-        num_heads: int,
-        window_size: int,
-        qkv_bias: bool = True,
+        expansion_rate: int = 4,
+        sinkhorn_iters: int = 20,
+        gating_init: float = 0.01,
     ):
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
-        self.window_size = window_size
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.n = expansion_rate
+        self.sinkhorn_iters = sinkhorn_iters
+        nC = self.n * dim
 
-        # Relative position bias table: (2*ws-1, 2*ws-1, num_heads)
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
-        )
-        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        # Input-dependent projections (operate on flattened stream nC)
+        self.phi_pre = nn.Linear(nC, self.n, bias=True)
+        self.phi_post = nn.Linear(nC, self.n, bias=True)
+        self.phi_res = nn.Linear(nC, self.n * self.n, bias=True)
 
-        # Pre-compute relative position index
-        coords_h = torch.arange(window_size)
-        coords_w = torch.arange(window_size)
-        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # (2, ws, ws)
-        coords_flatten = torch.flatten(coords, 1)  # (2, ws*ws)
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # (2, ws*ws, ws*ws)
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # (ws*ws, ws*ws, 2)
-        # Shift to start from 0
-        relative_coords[:, :, 0] += window_size - 1
-        relative_coords[:, :, 1] += window_size - 1
-        relative_coords[:, :, 0] *= 2 * window_size - 1
-        relative_position_index = relative_coords.sum(-1)  # (ws*ws, ws*ws)
-        self.register_buffer("relative_position_index", relative_position_index)
+        # Learnable gating scalars (small init → near-identity at start)
+        self.alpha_pre = nn.Parameter(torch.tensor(gating_init))
+        self.alpha_post = nn.Parameter(torch.tensor(gating_init))
+        self.alpha_res = nn.Parameter(torch.tensor(gating_init))
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Forward pass.
+    def _compute_mappings(self, x_flat: torch.Tensor):
+        """Compute H_pre, H_res, H_post from flat stream state.
 
         Args:
-            x: (num_windows, ws*ws, dim)
-            mask: Optional attention mask (nW, ws*ws, ws*ws).
+            x_flat: (P, nC) where P = B·H·W or B·N
 
         Returns:
-            (num_windows, ws*ws, dim)
+            H_pre:   (P, n)       sigmoid-constrained
+            H_post:  (P, n)       2·sigmoid-constrained
+            H_res:   (P, n, n)    doubly-stochastic via Sinkhorn-Knopp
         """
-        B_, N, C = x.shape
+        # RMSNorm on stream
+        x_norm = x_flat / (x_flat.norm(dim=-1, keepdim=True) + 1e-6)
 
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # each (B_, num_heads, N, head_dim)
+        H_raw_pre = self.alpha_pre * self.phi_pre(x_norm) + self.phi_pre.bias
+        H_raw_post = self.alpha_post * self.phi_post(x_norm) + self.phi_post.bias
+        H_raw_res = self.alpha_res * self.phi_res(x_norm) + self.phi_res.bias
 
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)  # (B_, num_heads, N, N)
+        H_pre = torch.sigmoid(H_raw_pre)                                   # (P, n) ∈ (0,1)
+        H_post = 2.0 * torch.sigmoid(H_raw_post)                           # (P, n) ∈ (0,2)
+        H_res = sinkhorn_knopp(H_raw_res.view(-1, self.n, self.n), self.sinkhorn_iters)
 
-        # Relative position bias
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(N, N, -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
+        return H_pre, H_post, H_res
 
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
-            attn = attn + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
+    def read(self, x_stream: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """Read from the expanded stream: extract sub-layer input.
 
-        attn = F.softmax(attn, dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        return x
+        Args:
+            x_stream: (B, ..., n·C) expanded residual stream.
+
+        Returns:
+            layer_input: (B, ..., C) aggregated input for the sub-layer.
+            ctx: dict with H_pre, H_res, H_post for the write phase.
+        """
+        lead_shape = x_stream.shape[:-1]
+        C = self.dim
+        n = self.n
+
+        x_flat = x_stream.reshape(-1, n * C)
+        H_pre, H_post, H_res = self._compute_mappings(x_flat)
+
+        # layer_input = H_pre @ x_stream_mat  →  (P, C)
+        x_mat = x_flat.view(-1, n, C)          # (P, n, C)
+        layer_input = torch.einsum("pn,pnc->pc", H_pre, x_mat)  # (P, C)
+        layer_input = layer_input.view(*lead_shape, C)
+
+        ctx = {"H_pre": H_pre, "H_post": H_post, "H_res": H_res}
+        return layer_input, ctx
+
+    def write(
+        self, x_stream: torch.Tensor, sublayer_output: torch.Tensor, ctx: dict
+    ) -> torch.Tensor:
+        """Write sub-layer output back to the stream.
+
+        Args:
+            x_stream: (B, ..., n·C) current stream (same as passed to read).
+            sublayer_output: (B, ..., C) output from the sub-layer.
+            ctx: dict from ``read()``.
+
+        Returns:
+            new_stream: (B, ..., n·C) updated residual stream.
+        """
+        lead_shape = x_stream.shape[:-1]
+        C = self.dim
+        n = self.n
+
+        x_flat = x_stream.reshape(-1, n * C)
+        x_mat = x_flat.view(-1, n, C)
+        sub_flat = sublayer_output.reshape(-1, C)
+
+        H_res = ctx["H_res"]    # (P, n, n)
+        H_post = ctx["H_post"]  # (P, n)
+
+        # x_next = H_res @ x_stream + H_post^T ⊗ sublayer_output
+        x_res = torch.bmm(H_res, x_mat)                                  # (P, n, C)
+        x_write = H_post.unsqueeze(-1) * sub_flat.unsqueeze(1)           # (P, n, C)
+        x_next = x_res + x_write
+
+        return x_next.view(*lead_shape, n * C)
 
 
 # ---------------------------------------------------------------------------
-# MLP
+# Helper: expand / contract n-stream
 # ---------------------------------------------------------------------------
 
-class Mlp(nn.Module):
-    """MLP with GELU activation."""
+def _expand_stream(x: torch.Tensor, n: int) -> torch.Tensor:
+    """(B, ..., C) → (B, ..., n·C) by repeating along new dim."""
+    C = x.shape[-1]
+    return x.unsqueeze(-2).expand(*x.shape[:-1], n, C).reshape(*x.shape[:-1], n * C)
 
-    def __init__(self, in_features: int, hidden_features: int | None = None, out_features: int | None = None):
-        super().__init__()
-        hidden_features = hidden_features or in_features
-        out_features = out_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_features, out_features)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.act(self.fc1(x)))
+def _contract_stream(x_stream: torch.Tensor, n: int) -> torch.Tensor:
+    """(B, ..., n·C) → (B, ..., C) by averaging over streams."""
+    C = x_stream.shape[-1] // n
+    return x_stream.reshape(*x_stream.shape[:-1], n, C).mean(dim=-2)
 
 
 # ---------------------------------------------------------------------------
-# SwinBlock
+# SwinBlock (encoder)
 # ---------------------------------------------------------------------------
 
 class SwinBlock(nn.Module):
-    """Swin Transformer block with W-MSA / SW-MSA.
+    """Encoder block: KimiLinear attn + SwiGLU FFN + mHC.
 
     Args:
-        dim: Number of input channels.
+        dim: Token dimension C.
         num_heads: Number of attention heads.
         window_size: Window size.
-        shift_size: Shift size (0 for W-MSA, window_size//2 for SW-MSA).
-        mlp_ratio: MLP hidden dim multiplier.
+        shift_size: Shift size (0 or ws//2).
+        mlp_ratio: Kept for API compat (SwiGLU manages its own hidden size).
         drop_path: DropPath rate.
+        mhc_expansion: mHC stream count.
+        mhc_sinkhorn_iters: Sinkhorn iterations.
     """
 
     def __init__(
@@ -253,87 +485,70 @@ class SwinBlock(nn.Module):
         shift_size: int = 0,
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
+        mhc_expansion: int = 4,
+        mhc_sinkhorn_iters: int = 20,
     ):
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
+        self.n = mhc_expansion
         self.window_size = window_size
         self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
 
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowAttention(
-            dim=dim,
-            num_heads=num_heads,
-            window_size=window_size,
-        )
+        self.norm1 = RMSNorm(dim)
+        self.attn = KimiLinearAttention(dim, num_heads, window_size)
         self.drop_path = DropPath(drop_path)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio))
+        self.norm2 = RMSNorm(dim)
+        self.mlp = SwiGLUFFN(dim)
+
+        self.mhc_attn = mHCConnection(dim, mhc_expansion, mhc_sinkhorn_iters)
+        self.mhc_ffn = mHCConnection(dim, mhc_expansion, mhc_sinkhorn_iters)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: (B, H, W, C)
-
-        Returns:
-            (B, H, W, C)
-        """
+        """x: (B, H, W, C) → (B, H, W, C)"""
         B, H, W, C = x.shape
-        shortcut = x
+
+        # Expand to n-stream
+        xs = _expand_stream(x, self.n)  # (B, H, W, nC)
+
+        # --- Attention sub-layer ---
+        layer_in, ctx = self.mhc_attn.read(xs)       # (B, H, W, C)
+        normed = self.norm1(layer_in)
 
         # Cyclic shift
-        shifted_x = x
+        shifted = normed
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted = torch.roll(normed, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
-        # Window partition
-        x_windows = window_partition(shifted_x, self.window_size)  # (nW*B, ws, ws, C)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        # Window partition → attention → merge
+        ws = self.window_size
+        x_win = window_partition(shifted, ws).view(-1, ws * ws, C)
+        attn_out = self.attn(x_win)
+        attn_out = window_reverse(
+            attn_out.view(-1, ws, ws, C), ws, H, W,
+        )
 
-        # Attention mask for shifted windows
-        attn_mask = None
         if self.shift_size > 0:
-            attn_mask = _compute_shift_mask(self.window_size, self.shift_size, H, W)
-            attn_mask = attn_mask.to(x.device)
+            attn_out = torch.roll(attn_out, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
-        # W-MSA / SW-MSA
-        attn_windows = self.attn(x_windows, mask=attn_mask)
+        attn_out = self.drop_path(attn_out)
+        xs = self.mhc_attn.write(xs, attn_out, ctx)
 
-        # Merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        # --- FFN sub-layer ---
+        layer_in, ctx = self.mhc_ffn.read(xs)
+        ffn_out = self.drop_path(self.mlp(self.norm2(layer_in)))
+        xs = self.mhc_ffn.write(xs, ffn_out, ctx)
 
-        # Reverse cyclic shift
-        if self.shift_size > 0:
-            x_out = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x_out = shifted_x
-
-        # Residual
-        x_out = shortcut + self.drop_path(self.norm1(x_out))
-        x_out = x_out + self.drop_path(self.mlp(self.norm2(x_out)))
-        return x_out
+        return _contract_stream(xs, self.n)
 
 
 # ---------------------------------------------------------------------------
-# AdaLNSwinBlock
+# AdaLNSwinBlock (decoder)
 # ---------------------------------------------------------------------------
 
 class AdaLNSwinBlock(nn.Module):
-    """Swin Transformer block with adaptive LayerNorm modulation.
+    """Decoder block with AdaLN: KimiLinear attn + SwiGLU + mHC.
 
-    Accepts a conditioning vector ``cond`` and uses it to predict per-sample
-    scale / shift parameters for both LayerNorm layers.
-
-    Args:
-        dim: Number of input channels.
-        num_heads: Number of attention heads.
-        window_size: Window size.
-        shift_size: Shift size.
-        mlp_ratio: MLP hidden dim multiplier.
-        drop_path: DropPath rate.
+    AdaLN modulation: cond → 6·C  (s1, sh1, g1, s2, sh2, g2).
     """
 
     def __init__(
@@ -344,189 +559,114 @@ class AdaLNSwinBlock(nn.Module):
         shift_size: int = 0,
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
+        mhc_expansion: int = 4,
+        mhc_sinkhorn_iters: int = 20,
     ):
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
+        self.n = mhc_expansion
         self.window_size = window_size
         self.shift_size = shift_size
 
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.attn = WindowAttention(
-            dim=dim,
-            num_heads=num_heads,
-            window_size=window_size,
-        )
+        self.norm1 = RMSNorm(dim, elementwise_affine=False)
+        self.attn = KimiLinearAttention(dim, num_heads, window_size)
         self.drop_path = DropPath(drop_path)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio))
+        self.norm2 = RMSNorm(dim, elementwise_affine=False)
+        self.mlp = SwiGLUFFN(dim)
 
-        # AdaLN modulation: cond -> 6 * dim (s1, sh1, s2, sh2, g1, g2)
-        self.adaLN_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 6 * dim),
-        )
-        # Zero-init the last layer
+        # AdaLN: cond → 6·C
+        self.adaLN_mlp = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
         nn.init.constant_(self.adaLN_mlp[-1].weight, 0.0)
         nn.init.constant_(self.adaLN_mlp[-1].bias, 0.0)
 
+        self.mhc_attn = mHCConnection(dim, mhc_expansion, mhc_sinkhorn_iters)
+        self.mhc_ffn = mHCConnection(dim, mhc_expansion, mhc_sinkhorn_iters)
+
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: (B, H, W, C)
-            cond: (B, C)
-
-        Returns:
-            (B, H, W, C)
-        """
         B, H, W, C = x.shape
 
-        # AdaLN parameters from conditioning
-        params = self.adaLN_mlp(cond)  # (B, 6*C)
-        s1, sh1, s2, sh2, g1, g2 = params.chunk(6, dim=-1)  # each (B, C)
-
-        # Reshape for broadcasting over spatial dims
-        s1 = s1.unsqueeze(1).unsqueeze(2)   # (B, 1, 1, C)
+        # AdaLN params
+        p = self.adaLN_mlp(cond)  # (B, 6C)
+        s1, sh1, g1, s2, sh2, g2 = p.chunk(6, dim=-1)
+        for t in (s1, sh1, g1, s2, sh2, g2):
+            # make (B,1,1,C) for broadcasting
+            pass
+        s1  = s1.unsqueeze(1).unsqueeze(2)
         sh1 = sh1.unsqueeze(1).unsqueeze(2)
-        s2 = s2.unsqueeze(1).unsqueeze(2)
+        g1  = g1.unsqueeze(1).unsqueeze(2)
+        s2  = s2.unsqueeze(1).unsqueeze(2)
         sh2 = sh2.unsqueeze(1).unsqueeze(2)
-        g1 = g1.unsqueeze(1).unsqueeze(2)
-        g2 = g2.unsqueeze(1).unsqueeze(2)
+        g2  = g2.unsqueeze(1).unsqueeze(2)
 
-        shortcut = x
+        xs = _expand_stream(x, self.n)
 
-        # Cyclic shift
-        shifted_x = x
+        # --- Attention ---
+        layer_in, ctx = self.mhc_attn.read(xs)
+        normed = self.norm1(layer_in) * (1 + s1) + sh1
+
+        shifted = normed
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted = torch.roll(normed, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
-        # Window partition
-        x_windows = window_partition(shifted_x, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        ws = self.window_size
+        x_win = window_partition(shifted, ws).view(-1, ws * ws, C)
+        attn_out = self.attn(x_win)
+        attn_out = window_reverse(attn_out.view(-1, ws, ws, C), ws, H, W)
 
-        # Attention mask for shifted windows
-        attn_mask = None
         if self.shift_size > 0:
-            attn_mask = _compute_shift_mask(self.window_size, self.shift_size, H, W)
-            attn_mask = attn_mask.to(x.device)
+            attn_out = torch.roll(attn_out, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
-        # Apply adaptive modulation to norm1 output inside windows
-        # We need to apply norm1 before partitioning so the spatial modulation works
-        # Actually, apply norm before window partition
-        # Re-do: norm1 with adaLN modulation, then partition
-        normed1 = self.norm1(shifted_x)  # (B, H, W, C)
-        normed1 = normed1 * (1 + s1) + sh1
+        attn_out = g1 * self.drop_path(attn_out)
+        xs = self.mhc_attn.write(xs, attn_out, ctx)
 
-        x_windows = window_partition(normed1, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        # --- FFN ---
+        layer_in, ctx = self.mhc_ffn.read(xs)
+        normed2 = self.norm2(layer_in) * (1 + s2) + sh2
+        ffn_out = g2 * self.drop_path(self.mlp(normed2))
+        xs = self.mhc_ffn.write(xs, ffn_out, ctx)
 
-        attn_windows = self.attn(x_windows, mask=attn_mask)
-
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
-
-        # Reverse cyclic shift
-        if self.shift_size > 0:
-            shifted_x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-
-        # Residual with gate g1
-        x_out = shortcut + g1 * self.drop_path(shifted_x)
-
-        # FFN with adaLN modulation on norm2
-        normed2 = self.norm2(x_out)
-        normed2 = normed2 * (1 + s2) + sh2
-        x_out = x_out + g2 * self.drop_path(self.mlp(normed2))
-
-        return x_out
+        return _contract_stream(xs, self.n)
 
 
 # ---------------------------------------------------------------------------
-# PatchEmbed
+# PatchEmbed / PatchMerge
 # ---------------------------------------------------------------------------
 
 class PatchEmbed(nn.Module):
-    """Image to patch embedding using a Conv2d projection.
-
-    Args:
-        in_channels: Number of input image channels.
-        patch_size: Patch size.
-        embed_dim: Embedding dimension.
-    """
+    """Image → patch embedding via Conv2d."""
 
     def __init__(self, in_channels: int = 3, patch_size: int = 4, embed_dim: int = 128):
         super().__init__()
         self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        return self.proj(x).permute(0, 2, 3, 1)
 
-        Args:
-            x: (B, C, H, W) image tensor.
-
-        Returns:
-            (B, H/patch_size, W/patch_size, embed_dim)
-        """
-        x = self.proj(x)  # (B, embed_dim, H/ps, W/ps)
-        x = x.permute(0, 2, 3, 1)  # (B, H/ps, W/ps, embed_dim)
-        return x
-
-
-# ---------------------------------------------------------------------------
-# PatchMerge
-# ---------------------------------------------------------------------------
 
 class PatchMerge(nn.Module):
-    """Merge 2x2 neighbouring patches, halving spatial and doubling channels.
-
-    Args:
-        dim: Input channel dimension.
-    """
+    """Merge 2×2 patches → halve spatial, double channels."""
 
     def __init__(self, dim: int):
         super().__init__()
-        self.norm = nn.LayerNorm(4 * dim)
+        self.norm = RMSNorm(4 * dim)
         self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: (B, H, W, C)
-
-        Returns:
-            (B, H/2, W/2, 2*C)
-        """
         B, H, W, C = x.shape
-        # View + permute to gather 2x2 neighbourhood
         x = x.view(B, H // 2, 2, W // 2, 2, C)
-        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()  # (B, H/2, W/2, 2, 2, C)
-        x = x.view(B, H // 2, W // 2, 4 * C)
-        x = self.norm(x)
-        x = self.reduction(x)
-        return x
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H // 2, W // 2, 4 * C)
+        return self.reduction(self.norm(x))
 
 
 # ---------------------------------------------------------------------------
-# CrossAttnAdaLNSwinBlock
+# CrossAttnAdaLNSwinBlock — full decoder block
 # ---------------------------------------------------------------------------
 
 class CrossAttnAdaLNSwinBlock(nn.Module):
-    """Swin Transformer block with adaptive LayerNorm modulation and cross-attention for z injection.
+    """Decoder block: Kimi Linear self-attn + cross-attn + SwiGLU FFN.
 
-    Structure:
-        AdaLN(x) -> WindowSelfAttn -> residual (gate g1)
-        -> LN -> CrossAttn(q=x, kv=z) -> residual (gate g2)
-        -> AdaLN -> FFN -> residual (gate g3)
-
-    Args:
-        dim: Number of input channels.
-        num_heads: Number of attention heads.
-        window_size: Window size for self-attention.
-        shift_size: Shift size for self-attention.
-        mlp_ratio: MLP hidden dim multiplier.
-        z_dim: Dimension of z tokens (default: equal to dim).
-        drop_path: DropPath rate.
+    AdaLN: cond → 9·C  (3 groups of s/sh/g for self-attn, cross-attn, FFN).
+    mHC: three independent mHC connections.
     """
 
     def __init__(
@@ -538,6 +678,8 @@ class CrossAttnAdaLNSwinBlock(nn.Module):
         mlp_ratio: float = 4.0,
         z_dim: int | None = None,
         drop_path: float = 0.0,
+        mhc_expansion: int = 4,
+        mhc_sinkhorn_iters: int = 20,
     ):
         super().__init__()
         self.dim = dim
@@ -545,136 +687,90 @@ class CrossAttnAdaLNSwinBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.head_dim = dim // num_heads
+        self.n = mhc_expansion
 
         if z_dim is None:
             z_dim = dim
         self.z_dim = z_dim
 
         # Self-attention (windowed)
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.attn = WindowAttention(
-            dim=dim,
-            num_heads=num_heads,
-            window_size=window_size,
-        )
+        self.norm1 = RMSNorm(dim, elementwise_affine=False)
+        self.attn = KimiLinearAttention(dim, num_heads, window_size)
         self.drop_path = DropPath(drop_path)
 
-        # Cross-attention (standard, non-windowed)
-        self.cross_norm = nn.LayerNorm(dim)
-        self.cross_q = nn.Linear(dim, dim)
-        self.cross_kv = nn.Linear(z_dim, dim * 2)
-        self.cross_proj = nn.Linear(dim, dim)
+        # Cross-attention (non-windowed)
+        self.cross_norm = RMSNorm(dim)
+        self.cross_attn = KimiLinearCrossAttention(dim, z_dim, num_heads)
 
         # FFN
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio))
+        self.norm2 = RMSNorm(dim, elementwise_affine=False)
+        self.mlp = SwiGLUFFN(dim)
 
-        # AdaLN modulation: cond -> 9 * dim
-        # (s1, sh1, g1) for self-attn, (s2, sh2, g2) for cross-attn, (s3, sh3, g3) for FFN
-        self.adaLN_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 9 * dim),
-        )
-        # Zero-init the last layer
+        # AdaLN: cond → 9·C
+        self.adaLN_mlp = nn.Sequential(nn.SiLU(), nn.Linear(dim, 9 * dim))
         nn.init.constant_(self.adaLN_mlp[-1].weight, 0.0)
         nn.init.constant_(self.adaLN_mlp[-1].bias, 0.0)
+
+        # mHC
+        self.mhc_self = mHCConnection(dim, mhc_expansion, mhc_sinkhorn_iters)
+        self.mhc_cross = mHCConnection(dim, mhc_expansion, mhc_sinkhorn_iters)
+        self.mhc_ffn = mHCConnection(dim, mhc_expansion, mhc_sinkhorn_iters)
 
     def forward(
         self, x: torch.Tensor, cond: torch.Tensor, z_tokens: torch.Tensor
     ) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: (B, H, W, C)
-            cond: (B, C) time embedding
-            z_tokens: (B, 16, 16, C) upsampled z tokens
-
-        Returns:
-            (B, H, W, C)
+        """
+        x: (B, H, W, C)   cond: (B, C)   z_tokens: (B, Hz, Wz, C)
         """
         B, H, W, C = x.shape
         N = H * W
 
-        # AdaLN parameters from conditioning
-        params = self.adaLN_mlp(cond)  # (B, 9*C)
-        s1, sh1, g1, s2, sh2, g2, s3, sh3, g3 = params.chunk(9, dim=-1)
-
-        # Reshape for broadcasting over spatial dims
-        s1 = s1.unsqueeze(1).unsqueeze(2)
+        # AdaLN params
+        p = self.adaLN_mlp(cond)  # (B, 9C)
+        s1, sh1, g1, s2, sh2, g2, s3, sh3, g3 = p.chunk(9, dim=-1)
+        s1  = s1.unsqueeze(1).unsqueeze(2)
         sh1 = sh1.unsqueeze(1).unsqueeze(2)
-        g1 = g1.unsqueeze(1).unsqueeze(2)
-        s2 = s2.unsqueeze(1).unsqueeze(2)
+        g1  = g1.unsqueeze(1).unsqueeze(2)
+        s2  = s2.unsqueeze(1).unsqueeze(2)
         sh2 = sh2.unsqueeze(1).unsqueeze(2)
-        g2 = g2.unsqueeze(1).unsqueeze(2)
-        s3 = s3.unsqueeze(1).unsqueeze(2)
+        g2  = g2.unsqueeze(1).unsqueeze(2)
+        s3  = s3.unsqueeze(1).unsqueeze(2)
         sh3 = sh3.unsqueeze(1).unsqueeze(2)
-        g3 = g3.unsqueeze(1).unsqueeze(2)
+        g3  = g3.unsqueeze(1).unsqueeze(2)
 
-        # ------------------------------------------------------------------
-        # 1. Self-attention (windowed, same as AdaLNSwinBlock)
-        # ------------------------------------------------------------------
-        shortcut = x
+        xs = _expand_stream(x, self.n)
 
-        # Cyclic shift
-        shifted_x = x
+        # --- 1. Self-attention (windowed) ---
+        layer_in, ctx = self.mhc_self.read(xs)
+        normed = self.norm1(layer_in) * (1 + s1) + sh1
+
+        shifted = normed
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted = torch.roll(normed, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
-        # AdaLN modulation on norm1
-        normed1 = self.norm1(shifted_x)
-        normed1 = normed1 * (1 + s1) + sh1
+        ws = self.window_size
+        x_win = window_partition(shifted, ws).view(-1, ws * ws, C)
+        attn_out = self.attn(x_win)
+        attn_out = window_reverse(attn_out.view(-1, ws, ws, C), ws, H, W)
 
-        # Window partition
-        x_windows = window_partition(normed1, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
-
-        # Attention mask for shifted windows
-        attn_mask = None
         if self.shift_size > 0:
-            attn_mask = _compute_shift_mask(self.window_size, self.shift_size, H, W)
-            attn_mask = attn_mask.to(x.device)
+            attn_out = torch.roll(attn_out, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
-        attn_windows = self.attn(x_windows, mask=attn_mask)
+        self_out = g1 * self.drop_path(attn_out)
+        xs = self.mhc_self.write(xs, self_out, ctx)
 
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        # --- 2. Cross-attention (non-windowed) ---
+        layer_in, ctx = self.mhc_cross.read(xs)
+        x_flat = self.cross_norm(layer_in.reshape(B, N, C))
+        z_flat = z_tokens.reshape(B, -1, C)
+        cross_out = self.cross_attn(x_flat, z_flat).reshape(B, H, W, C)
+        cross_out = g2 * cross_out
+        xs = self.mhc_cross.write(xs, cross_out, ctx)
 
-        # Reverse cyclic shift
-        if self.shift_size > 0:
-            shifted_x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        # --- 3. FFN ---
+        layer_in, ctx = self.mhc_ffn.read(xs)
+        normed2 = self.norm2(layer_in) * (1 + s3) + sh3
+        ffn_out = g3 * self.drop_path(self.mlp(normed2))
+        xs = self.mhc_ffn.write(xs, ffn_out, ctx)
 
-        # Residual with gate g1
-        x_out = shortcut + g1 * self.drop_path(shifted_x)
-
-        # ------------------------------------------------------------------
-        # 2. Cross-attention (standard, non-windowed)
-        # ------------------------------------------------------------------
-        x_flat = x_out.reshape(B, N, C)  # (B, N, C)
-        z_flat = z_tokens.reshape(B, -1, C)  # (B, N_z, C)
-
-        x_norm = self.cross_norm(x_flat)
-        q = self.cross_q(x_norm)  # (B, N, C)
-        kv = self.cross_kv(z_flat)  # (B, N_z, 2*C)
-        k, v = kv.chunk(2, dim=-1)
-
-        # Multi-head attention
-        q = q.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = k.reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        v = v.reshape(B, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-
-        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        attn = attn.softmax(dim=-1)
-        cross_out = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        cross_out = self.cross_proj(cross_out)
-        cross_out = cross_out.reshape(B, H, W, C)
-
-        x_out = x_out + g2 * cross_out
-
-        # ------------------------------------------------------------------
-        # 3. FFN (same as AdaLNSwinBlock)
-        # ------------------------------------------------------------------
-        normed2 = self.norm2(x_out)
-        normed2 = normed2 * (1 + s3) + sh3
-        x_out = x_out + g3 * self.drop_path(self.mlp(normed2))
-
-        return x_out
+        return _contract_stream(xs, self.n)

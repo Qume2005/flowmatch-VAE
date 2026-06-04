@@ -31,6 +31,17 @@ class DecoderConfig:
 
 
 @dataclass
+class mHCConfig:
+    """Manifold-constrained Hyper-Connections configuration.
+
+    Based on "mHC: Manifold-Constrained Hyper-Connections" (arXiv:2512.24880).
+    """
+    expansion_rate: int = 4          # n — number of parallel residual streams
+    sinkhorn_iters: int = 20         # Sinkhorn-Knopp iterations for doubly stochastic projection
+    gating_init: float = 0.01        # Initial value for learnable gating alphas
+
+
+@dataclass
 class TrainConfig:
     """Training hyperparameters."""
     batch_size: int = 512
@@ -52,4 +63,5 @@ class TrainConfig:
 class Config:
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    mhc: mHCConfig = field(default_factory=mHCConfig)
     train: TrainConfig = field(default_factory=TrainConfig)

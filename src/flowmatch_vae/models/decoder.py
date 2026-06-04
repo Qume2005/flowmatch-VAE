@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from flowmatch_vae.config import DecoderConfig
-from flowmatch_vae.models.swin import PatchEmbed, CrossAttnAdaLNSwinBlock
+from flowmatch_vae.models.swin import PatchEmbed, CrossAttnAdaLNSwinBlock, RMSNorm
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -37,16 +37,20 @@ class FlowDecoder(nn.Module):
 
     架构:
     - x_t 通过 PatchEmbed 编码为 tokens
-    - z 上采样后与 x_t tokens 相加
+    - z 上采样后通过 cross-attention 注入
     - t 通过 sinusoidal embedding + MLP -> adaLN conditioning
-    - N 个 AdaLNSwinBlock 处理
+    - N 个 CrossAttnAdaLNSwinBlock 处理
     - Linear 输出头 -> velocity
     """
 
-    def __init__(self, cfg: DecoderConfig):
+    def __init__(self, cfg: DecoderConfig, mhc_cfg=None):
         super().__init__()
         self.cfg = cfg
         self.patch_size = cfg.patch_size
+
+        # mHC config
+        mhc_expansion = getattr(mhc_cfg, "expansion_rate", 4) if mhc_cfg else 4
+        mhc_sinkhorn_iters = getattr(mhc_cfg, "sinkhorn_iters", 20) if mhc_cfg else 20
 
         self.patch_embed = PatchEmbed(
             in_channels=cfg.out_channels,
@@ -66,12 +70,13 @@ class FlowDecoder(nn.Module):
                 window_size=cfg.window_size,
                 shift_size=0 if (i % 2 == 0) else cfg.window_size // 2,
                 mlp_ratio=cfg.mlp_ratio,
+                mhc_expansion=mhc_expansion,
+                mhc_sinkhorn_iters=mhc_sinkhorn_iters,
             )
             for i in range(cfg.depth)
         ])
 
-        self.out_norm = nn.LayerNorm(cfg.embed_dim)
-        # patch_size^2 * out_channels 用于 pixel_shuffle
+        self.out_norm = RMSNorm(cfg.embed_dim)
         self.out_proj = nn.Linear(cfg.embed_dim, cfg.patch_size * cfg.patch_size * cfg.out_channels)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -87,22 +92,22 @@ class FlowDecoder(nn.Module):
         h = self.patch_embed(x_t)
 
         # z 投影 + 上采样 -> (B, 16, 16, embed_dim)
-        z_proj = self.z_proj(z)  # (B, 8, 8, embed_dim)
-        z_proj = z_proj.permute(0, 3, 1, 2)  # (B, embed_dim, 8, 8)
-        z_proj = self.z_upsample(z_proj)       # (B, embed_dim, 16, 16)
-        z_proj = z_proj.permute(0, 2, 3, 1)   # (B, 16, 16, embed_dim)
+        z_proj = self.z_proj(z)
+        z_proj = z_proj.permute(0, 3, 1, 2)
+        z_proj = self.z_upsample(z_proj)
+        z_proj = z_proj.permute(0, 2, 3, 1)
 
-        t_emb = self.time_embed(t)  # (B, embed_dim)
+        t_emb = self.time_embed(t)
 
         for block in self.blocks:
             h = block(h, t_emb, z_proj)
 
         h = self.out_norm(h)
-        h = self.out_proj(h)  # (B, 16, 16, ps^2 * out_channels)
+        h = self.out_proj(h)
 
         # Reshape to image via pixel_shuffle
         ps = self.patch_size
-        h = h.permute(0, 3, 1, 2)  # (B, ps^2*C, 16, 16)
-        h = nn.functional.pixel_shuffle(h, ps)  # (B, C, 64, 64)
+        h = h.permute(0, 3, 1, 2)
+        h = nn.functional.pixel_shuffle(h, ps)
 
         return h

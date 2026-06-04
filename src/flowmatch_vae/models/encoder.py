@@ -5,14 +5,18 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from flowmatch_vae.config import EncoderConfig
+from flowmatch_vae.config import EncoderConfig, Config
 from flowmatch_vae.models.swin import PatchEmbed, PatchMerge, SwinBlock
 
 
 class SwinEncoder(nn.Module):
-    def __init__(self, cfg: EncoderConfig):
+    def __init__(self, cfg: EncoderConfig, mhc_cfg=None):
         super().__init__()
         self.cfg = cfg
+
+        # mHC config (use defaults if not provided)
+        mhc_expansion = getattr(mhc_cfg, "expansion_rate", 4) if mhc_cfg else 4
+        mhc_sinkhorn_iters = getattr(mhc_cfg, "sinkhorn_iters", 20) if mhc_cfg else 20
 
         self.patch_embed = PatchEmbed(
             in_channels=cfg.in_channels,
@@ -37,6 +41,8 @@ class SwinEncoder(nn.Module):
                     shift_size=0 if (j % 2 == 0) else cfg.window_size // 2,
                     mlp_ratio=cfg.mlp_ratio,
                     drop_path=dpr[sum(depths[:i]) + j],
+                    mhc_expansion=mhc_expansion,
+                    mhc_sinkhorn_iters=mhc_sinkhorn_iters,
                 )
                 for j in range(depth)
             ])

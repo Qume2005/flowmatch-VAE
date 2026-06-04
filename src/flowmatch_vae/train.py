@@ -6,12 +6,13 @@ import os
 import time
 
 import torch
-from torch.optim import AdamW
+from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from flowmatch_vae.config import Config
 from flowmatch_vae.data.celeba import get_dataloader
 from flowmatch_vae.models.vae import FlowMatchVAE
+from flowmatch_vae.optimizers import Muon, split_param_groups
 
 
 def train(cfg: Config | None = None):
@@ -35,8 +36,20 @@ def train(cfg: Config | None = None):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params / 1e6:.2f}M")
 
-    optimizer = AdamW(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=tc.epochs)
+    # Split params: Muon for 2-D weight matrices, SGD for everything else
+    muon_group, sgd_group = split_param_groups(
+        model, lr=tc.lr, momentum=0.95, weight_decay=tc.weight_decay,
+    )
+    print(f"Muon params: {len(muon_group['params'])}, "
+          f"SGD params: {len(sgd_group['params'])}")
+
+    muon_opt = Muon([muon_group], lr=tc.lr, momentum=0.95,
+                    weight_decay=tc.weight_decay)
+    sgd_opt = SGD([sgd_group], lr=tc.lr, momentum=0.9,
+                  weight_decay=tc.weight_decay)
+
+    scheduler_muon = CosineAnnealingLR(muon_opt, T_max=tc.epochs)
+    scheduler_sgd = CosineAnnealingLR(sgd_opt, T_max=tc.epochs)
 
     for epoch in range(1, tc.epochs + 1):
         model.train()
@@ -68,10 +81,12 @@ def train(cfg: Config | None = None):
 
             loss = fm_loss + kl_weight * kl_loss
 
-            optimizer.zero_grad()
+            muon_opt.zero_grad()
+            sgd_opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            muon_opt.step()
+            sgd_opt.step()
 
             total_loss += loss.item()
             total_fm += fm_loss.item()
@@ -85,7 +100,8 @@ def train(cfg: Config | None = None):
                     f"kl={kl_loss.item():.4f} kl_w={kl_weight:.4f}"
                 )
 
-        scheduler.step()
+        scheduler_muon.step()
+        scheduler_sgd.step()
         elapsed = time.time() - epoch_start
         avg_loss = total_loss / n_batches
         avg_fm = total_fm / n_batches
@@ -94,7 +110,7 @@ def train(cfg: Config | None = None):
         print(
             f"Epoch {epoch}/{tc.epochs} | "
             f"loss={avg_loss:.4f} fm={avg_fm:.4f} kl={avg_kl:.4f} | "
-            f"lr={scheduler.get_last_lr()[0]:.6f} | "
+            f"lr={scheduler_muon.get_last_lr()[0]:.6f} | "
             f"time={elapsed:.1f}s"
         )
 
@@ -103,7 +119,8 @@ def train(cfg: Config | None = None):
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
+                "muon_state_dict": muon_opt.state_dict(),
+                "sgd_state_dict": sgd_opt.state_dict(),
                 "config": cfg,
             }, path)
             print(f"Saved checkpoint: {path}")

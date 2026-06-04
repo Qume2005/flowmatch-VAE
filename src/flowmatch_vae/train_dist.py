@@ -2,6 +2,8 @@
 
 Ray 只负责 worker 放置和生命周期管理，梯度同步走原生 PyTorch DDP (NCCL)。
 Ctrl+C 触发优雅停止: 保存 checkpoint → 跑 benchmark → 退出。
+
+优化器: Muon (2D 权重矩阵) + SGD (其余参数).
 """
 
 from __future__ import annotations
@@ -17,12 +19,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.optim import AdamW
+from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from flowmatch_vae.config import Config
 from flowmatch_vae.data.celeba import cache_dataset, get_transforms
 from flowmatch_vae.models.vae import FlowMatchVAE
+from flowmatch_vae.optimizers import Muon, split_param_groups
 
 # 主进程写此文件通知 worker 停止
 _STOP_FILE = os.path.join(tempfile.gettempdir(), "flowmatch_vae_stop")
@@ -77,8 +80,17 @@ class TrainingWorker:
             print(f"Model: {n_params / 1e6:.2f}M params, "
                   f"per-GPU batch: {per_gpu_bs}, total: {per_gpu_bs * self.world_size}")
 
-        optimizer = AdamW(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=tc.epochs)
+        # ---- Optimizers: Muon + SGD ----
+        muon_group, sgd_group = split_param_groups(
+            model, lr=tc.lr, momentum=0.95, weight_decay=tc.weight_decay,
+        )
+        muon_opt = Muon([muon_group], lr=tc.lr, momentum=0.95,
+                        weight_decay=tc.weight_decay)
+        sgd_opt = SGD([sgd_group], lr=tc.lr, momentum=0.9,
+                      weight_decay=tc.weight_decay)
+
+        scheduler_muon = CosineAnnealingLR(muon_opt, T_max=tc.epochs)
+        scheduler_sgd = CosineAnnealingLR(sgd_opt, T_max=tc.epochs)
 
         stop_reason = "completed"
 
@@ -102,10 +114,12 @@ class TrainingWorker:
                 images = images.to(self.device, non_blocking=True)
                 losses = model(images)
 
-                optimizer.zero_grad()
+                muon_opt.zero_grad()
+                sgd_opt.zero_grad()
                 losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                muon_opt.step()
+                sgd_opt.step()
 
                 total_loss += losses["loss"].item()
                 total_fm += losses["fm_loss"].item()
@@ -122,13 +136,14 @@ class TrainingWorker:
             elapsed = time.time() - epoch_start
 
             if self.rank == 0:
-                # 保存 checkpoint（每个 epoch 都存，中断时保证有最新的）
+                # 保存 checkpoint
                 os.makedirs(tc.save_dir, exist_ok=True)
                 path = os.path.join(tc.save_dir, "checkpoint_latest.pt")
                 torch.save({
                     "epoch": epoch,
                     "model_state_dict": model.module.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
+                    "muon_state_dict": muon_opt.state_dict(),
+                    "sgd_state_dict": sgd_opt.state_dict(),
                     "config": cfg,
                 }, path)
 
@@ -137,7 +152,7 @@ class TrainingWorker:
                           f"loss={total_loss / n_batches:.4f} "
                           f"fm={total_fm / n_batches:.4f} "
                           f"kl={total_kl / n_batches:.4f} | "
-                          f"lr={scheduler.get_last_lr()[0]:.6f} | "
+                          f"lr={scheduler_muon.get_last_lr()[0]:.6f} | "
                           f"time={elapsed:.1f}s")
 
                 if epoch % tc.sample_interval == 0 or stop_reason == "interrupted":
@@ -149,7 +164,8 @@ class TrainingWorker:
                 _benchmark(model.module, cfg, self.device)
                 break
 
-            scheduler.step()
+            scheduler_muon.step()
+            scheduler_sgd.step()
             dist.barrier()
 
         if stop_reason == "completed" and self.rank == 0:
@@ -269,9 +285,7 @@ def main():
         print(f"All workers finished: {results}")
     except KeyboardInterrupt:
         print("\nCtrl+C received. Signaling workers to stop...")
-        # 写停止信号文件
         open(_STOP_FILE, "w").close()
-        # 等待 worker 优雅退出（它们会在当前 batch 结束后停止、保存、benchmark）
         try:
             results = ray.get(train_futures, timeout=120)
             print(f"Workers stopped gracefully: {results}")
