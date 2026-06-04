@@ -17,6 +17,35 @@ class EncoderConfig:
 
 
 @dataclass
+class MultiScaleEncoderConfig:
+    """Multi-scale SwiGLU convolution encoder configuration.
+
+    Progressive 2x2 pooling from 64x64 down to 1x1 through 6 stages.
+    Each stage has SwiGLUConv layers followed by AttnPool2x2.
+    All scale features are fused via self-attention with 2D RoPE.
+    """
+    in_channels: int = 3
+    embed_dim: int = 256
+    # Number of SwiGLU conv layers per stage (6 stages: 64->32->16->8->4->2->1)
+    layers_per_stage: tuple[int, ...] = (3, 2, 2, 2, 1, 1)
+    # Dilation rates per stage (cycles through if more layers than rates)
+    dilations_per_stage: tuple[tuple[int, ...], ...] = (
+        (1, 2, 3, 4),  # 64x64: multi-scale dilated conv
+        (1,),           # 32x32
+        (1,),           # 16x16
+        (1,),           # 8x8
+        (1,),           # 4x4
+        (1,),           # 2x2
+    )
+    # Kernel size per stage (3 for spatial conv, 1 for pointwise)
+    kernel_sizes_per_stage: tuple[int, ...] = (3, 3, 3, 3, 1, 1)
+    # Number of attention heads for fusion
+    fusion_heads: int = 8
+    # Which scale index to extract latent from (2 = 8x8, the third pool output)
+    latent_scale_idx: int = 2
+
+
+@dataclass
 class DecoderConfig:
     """OT-CFM velocity network configuration."""
     out_channels: int = 3
@@ -61,7 +90,7 @@ class TrainConfig:
 
 @dataclass
 class Config:
-    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    encoder: MultiScaleEncoderConfig = field(default_factory=MultiScaleEncoderConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     mhc: mHCConfig = field(default_factory=mHCConfig)
     train: TrainConfig = field(default_factory=TrainConfig)

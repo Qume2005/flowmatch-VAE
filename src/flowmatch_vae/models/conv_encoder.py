@@ -257,3 +257,138 @@ class FusionAttention(nn.Module):
         # Normalise per head
         o = o / (o.norm(dim=-1, keepdim=True) + 1e-6) * (D ** 0.5)
         return self.out_proj(o.reshape(B, N, C))
+
+
+# ---------------------------------------------------------------------------
+# Multi-Scale SwiGLU Convolution Encoder
+# ---------------------------------------------------------------------------
+
+class MultiScaleConvEncoder(nn.Module):
+    """Multi-scale SwiGLU convolution encoder with attention pooling.
+
+    Architecture:
+        Image (B, 3, 64, 64)
+          -> stem Conv1x1(3, embed_dim)
+          -> 6 stages: SwiGLUConv x N_i -> AttnPool2x2
+            (64->32->16->8->4->2->1)
+          -> collect features from each scale -> (B, 1365, C)
+          -> add scale embeddings + 2D RoPE
+          -> FusionAttention -> extract 8x8 tokens
+          -> mu_head, logvar_head -> (B, 8, 8, C)
+
+    Args:
+        cfg: MultiScaleEncoderConfig dataclass.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        C = cfg.embed_dim
+        self.n_scales = len(cfg.layers_per_stage)
+
+        # Stem: expand channels
+        self.stem = nn.Sequential(
+            nn.Conv2d(cfg.in_channels, C, kernel_size=1),
+            RMSNorm2d(C),
+        )
+
+        # Build stages
+        self.stages = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        for i in range(self.n_scales):
+            n_layers = cfg.layers_per_stage[i]
+            dilations = cfg.dilations_per_stage[i]
+            k = (
+                cfg.kernel_sizes_per_stage[i]
+                if i < len(cfg.kernel_sizes_per_stage)
+                else cfg.kernel_sizes_per_stage[-1]
+            )
+            stage_layers = nn.ModuleList()
+            for j in range(n_layers):
+                d = dilations[j % len(dilations)]
+                stage_layers.append(SwiGLUConv(C, C, kernel_size=k, dilation=d))
+            self.stages.append(stage_layers)
+            self.pools.append(AttnPool2x2(C))
+
+        # Learnable scale embeddings
+        self.scale_embed = nn.Parameter(torch.randn(self.n_scales, C) * 0.02)
+
+        # Fusion attention
+        self.fusion = FusionAttention(C, cfg.fusion_heads)
+
+        # Output heads
+        self.mu_head = nn.Linear(C, C)
+        self.logvar_head = nn.Linear(C, C)
+
+    def _build_scale_positions(
+        self, spatial_sizes: list[tuple[int, int]], device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        """Build y/x position arrays for 2D RoPE across all scales.
+
+        Returns:
+            y_pos: (total_N,) y-coordinate per token
+            x_pos: (total_N,) x-coordinate per token
+            scale_lengths: [N_0, N_1, ...] token count per scale
+        """
+        all_y: list[torch.Tensor] = []
+        all_x: list[torch.Tensor] = []
+        scale_lengths: list[int] = []
+        for h, w in spatial_sizes:
+            ys = torch.arange(h, device=device, dtype=torch.float)
+            xs = torch.arange(w, device=device, dtype=torch.float)
+            gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+            all_y.append(gy.reshape(-1))
+            all_x.append(gx.reshape(-1))
+            scale_lengths.append(h * w)
+        return torch.cat(all_y), torch.cat(all_x), scale_lengths
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """x: (B, 3, 64, 64) -> mu: (B, 8, 8, C), logvar: (B, 8, 8, C)"""
+        B = x.shape[0]
+        C = self.cfg.embed_dim
+
+        h = self.stem(x)  # (B, C, 64, 64)
+
+        # Run stages, collect features at each scale
+        scale_features: list[torch.Tensor] = []
+        spatial_sizes: list[tuple[int, int]] = []
+
+        for i in range(self.n_scales):
+            # SwiGLU conv layers (same-padding preserves spatial size)
+            for layer in self.stages[i]:
+                h = layer(h)
+
+            # Attention pool 2x2
+            h = self.pools[i](h)  # (B, C, H//2, W//2)
+
+            # Record features (channels-last for token sequence)
+            _, _, Hi, Wi = h.shape
+            spatial_sizes.append((Hi, Wi))
+            scale_features.append(h.permute(0, 2, 3, 1).reshape(B, Hi * Wi, C))
+
+        # Build multi-scale token sequence with scale embeddings
+        for s in range(self.n_scales):
+            scale_features[s] = scale_features[s] + self.scale_embed[s]
+
+        all_tokens = torch.cat(scale_features, dim=1)  # (B, total_N, C)
+
+        # Build position arrays for 2D RoPE
+        y_pos, x_pos, scale_lengths = self._build_scale_positions(
+            spatial_sizes, x.device,
+        )
+
+        # Fusion self-attention
+        fused = self.fusion(all_tokens, y_pos, x_pos)  # (B, total_N, C)
+
+        # Extract scale-2 (8x8 = 64) tokens
+        latent_scale = self.cfg.latent_scale_idx
+        start = sum(scale_lengths[:latent_scale])
+        end = start + scale_lengths[latent_scale]
+        latent_tokens = fused[:, start:end, :]  # (B, 64, C)
+
+        Hi, Wi = spatial_sizes[latent_scale]
+        latent_tokens = latent_tokens.reshape(B, Hi, Wi, C)
+
+        mu = self.mu_head(latent_tokens)
+        logvar = self.logvar_head(latent_tokens)
+        return mu, logvar

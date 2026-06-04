@@ -2,7 +2,8 @@ import torch
 import torch.nn.functional as F
 from flowmatch_vae.config import Config
 from flowmatch_vae.models.vae import FlowMatchVAE
-from flowmatch_vae.models.conv_encoder import SwiGLUConv, RMSNorm2d, AttnPool2x2, apply_2d_rope, FusionAttention
+from flowmatch_vae.models.conv_encoder import SwiGLUConv, RMSNorm2d, AttnPool2x2, apply_2d_rope, FusionAttention, MultiScaleConvEncoder
+from flowmatch_vae.config import MultiScaleEncoderConfig
 
 
 def test_rmsnorm2d():
@@ -100,3 +101,35 @@ def test_fusion_attention_shape():
     x_pos = torch.arange(N, dtype=torch.float)
     out = attn(torch.randn(B, N, C), y_pos, x_pos)
     assert out.shape == (B, N, C)
+
+
+def test_encoder_output_shape():
+    """Encoder produces mu, logvar of shape (B, 8, 8, C)."""
+    cfg = MultiScaleEncoderConfig()
+    enc = MultiScaleConvEncoder(cfg)
+    x = torch.randn(2, 3, 64, 64)
+    mu, logvar = enc(x)
+    assert mu.shape == (2, 8, 8, 256)
+    assert logvar.shape == (2, 8, 8, 256)
+
+
+def test_encoder_grad_flows():
+    """Gradients flow through the entire encoder."""
+    cfg = MultiScaleEncoderConfig()
+    enc = MultiScaleConvEncoder(cfg)
+    x = torch.randn(1, 3, 64, 64, requires_grad=True)
+    mu, logvar = enc(x)
+    mu.sum().backward()
+    assert x.grad is not None
+
+
+def test_encoder_small_config():
+    """Encoder works with minimal layers for fast testing."""
+    cfg = MultiScaleEncoderConfig(
+        layers_per_stage=(1, 1, 1, 1, 1, 1),
+        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+    )
+    enc = MultiScaleConvEncoder(cfg)
+    x = torch.randn(2, 3, 64, 64)
+    mu, logvar = enc(x)
+    assert mu.shape == (2, 8, 8, 256)
