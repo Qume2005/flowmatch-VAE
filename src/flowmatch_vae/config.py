@@ -33,7 +33,7 @@ class DecoderConfig:
 @dataclass
 class TrainConfig:
     """Training hyperparameters."""
-    batch_size: int = 128
+    batch_size: int = 512
     epochs: int = 200
     lr: float = 1e-4
     weight_decay: float = 0.01

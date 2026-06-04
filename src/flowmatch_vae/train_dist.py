@@ -20,7 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision.datasets import CelebA
 
 from flowmatch_vae.config import Config
-from flowmatch_vae.data.celeba import get_transforms, _ImageOnly
+from flowmatch_vae.data.celeba import get_transforms, cache_dataset
 from flowmatch_vae.models.vae import FlowMatchVAE
 
 
@@ -41,11 +41,12 @@ def train_func(config: dict):
     if rank == 0:
         print(f"Distributed training: {world_size} GPUs, device={device}")
 
-    # ---- Data ----
-    transform = get_transforms(tc.image_size)
-
-    dataset = _ImageOnly(CelebA(root=tc.data_path, split="train", target_type=["attr"],
-                                transform=transform, download=False))
+    # ---- Data (内存缓存，零 IO) ----
+    if rank == 0:
+        print("Loading dataset into memory...")
+    dataset = cache_dataset(tc.data_path, tc.image_size)
+    if rank == 0:
+        print(f"Dataset ready: {len(dataset)} images")
 
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank,
@@ -54,7 +55,7 @@ def train_func(config: dict):
     per_gpu_bs = max(1, tc.batch_size // world_size)
     loader = DataLoader(
         dataset, batch_size=per_gpu_bs, sampler=sampler,
-        num_workers=4, pin_memory=True,
+        num_workers=8, pin_memory=True,
     )
 
     # ---- Model (DDP) ----
