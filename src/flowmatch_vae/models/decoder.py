@@ -1,4 +1,16 @@
-"""OT-CFM 速度场网络：条件 Swin 架构，预测 velocity field。"""
+"""U-Net Multi-Scale OT-CFM Velocity Network.
+
+Decoder operates at 5 spatial levels (16x16 -> 8x8 -> 4x4 -> 2x2 -> 1x1)
+with DiT blocks at each level. Down path uses AttnPool2x2, up path uses
+Upsample2x. Skip connections via addition. Each level cross-attends to
+the VAE encoder's corresponding scale features.
+
+Architecture:
+    x_t -> PatchEmbed -> (B, 16, 16, C)
+    Down:  Level 0 (16x16) -> Level 1 (8x8) -> ... -> Level 4 (1x1)
+    Up:    Level 4 (1x1) -> Level 3 (2x2) -> ... -> Level 0 (16x16)
+    Output: RMSNorm -> Linear -> pixel_shuffle -> v_pred
+"""
 
 from __future__ import annotations
 
@@ -6,13 +18,14 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from flowmatch_vae.config import DecoderConfig
 from flowmatch_vae.models.swin import PatchEmbed, CrossAttnAdaLNSwinBlock, RMSNorm
+from flowmatch_vae.models.conv_encoder import AttnPool2x2, Upsample2x
 
 
 class SinusoidalTimeEmbedding(nn.Module):
-    """将标量时间 t 编码为向量。"""
+    """Sinusoidal time embedding: scalar t -> vector."""
 
     def __init__(self, dim: int):
         super().__init__()
@@ -33,81 +46,173 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 class FlowDecoder(nn.Module):
-    """OT-CFM velocity network: v_θ(x_t, t, z) -> velocity field。
+    """U-Net multi-scale OT-CFM velocity network.
 
-    架构:
-    - x_t 通过 PatchEmbed 编码为 tokens
-    - z 上采样后通过 cross-attention 注入
-    - t 通过 sinusoidal embedding + MLP -> adaLN conditioning
-    - N 个 CrossAttnAdaLNSwinBlock 处理
-    - Linear 输出头 -> velocity
+    Args:
+        cfg: MultiScaleDecoderConfig dataclass.
+        mhc_cfg: Optional mHC config for DiT blocks.
     """
 
-    def __init__(self, cfg: DecoderConfig, mhc_cfg=None):
+    def __init__(self, cfg, mhc_cfg=None):
         super().__init__()
         self.cfg = cfg
-        self.patch_size = cfg.patch_size
+        C = cfg.embed_dim
+        ps = cfg.patch_size
 
         # mHC config
         mhc_expansion = getattr(mhc_cfg, "expansion_rate", 4) if mhc_cfg else 4
         mhc_sinkhorn_iters = getattr(mhc_cfg, "sinkhorn_iters", 20) if mhc_cfg else 20
 
+        # Patch embedding for x_t
         self.patch_embed = PatchEmbed(
             in_channels=cfg.out_channels,
-            patch_size=cfg.patch_size,
-            embed_dim=cfg.embed_dim,
+            patch_size=ps,
+            embed_dim=C,
         )
 
-        self.time_embed = SinusoidalTimeEmbedding(cfg.embed_dim)
+        # Time embedding
+        self.time_embed = SinusoidalTimeEmbedding(C)
 
-        self.z_proj = nn.Linear(cfg.latent_dim, cfg.embed_dim)
-        self.z_upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        # Decoder levels (from fine to coarse): 16x16, 8x8, 4x4, 2x2, 1x1
+        # Map to VAE encoder scale indices: 1, 2, 3, 4, 5
+        self.vae_scale_map = [1, 2, 3, 4, 5]  # decoder level -> VAE encoder scale
+        n_levels = len(cfg.blocks_down)
 
-        self.blocks = nn.ModuleList([
-            CrossAttnAdaLNSwinBlock(
-                dim=cfg.embed_dim,
-                num_heads=cfg.num_heads,
-                window_size=cfg.window_size,
-                shift_size=0 if (i % 2 == 0) else cfg.window_size // 2,
-                mlp_ratio=cfg.mlp_ratio,
-                mhc_expansion=mhc_expansion,
-                mhc_sinkhorn_iters=mhc_sinkhorn_iters,
-            )
-            for i in range(cfg.depth)
-        ])
+        # --- Down path ---
+        self.down_blocks = nn.ModuleList()
+        self.down_pools = nn.ModuleList()
+        for level in range(n_levels):
+            n_blocks = cfg.blocks_down[level]
+            # Window size: use cfg.window_size for larger levels, min(H,W) for small
+            ws = cfg.window_size
+            level_blocks = nn.ModuleList()
+            for j in range(n_blocks):
+                shift = 0 if j % 2 == 0 else ws // 2
+                level_blocks.append(CrossAttnAdaLNSwinBlock(
+                    dim=C,
+                    num_heads=cfg.num_heads,
+                    window_size=ws,
+                    shift_size=shift,
+                    mhc_expansion=mhc_expansion,
+                    mhc_sinkhorn_iters=mhc_sinkhorn_iters,
+                ))
+            self.down_blocks.append(level_blocks)
 
-        self.out_norm = RMSNorm(cfg.embed_dim)
-        self.out_proj = nn.Linear(cfg.embed_dim, cfg.patch_size * cfg.patch_size * cfg.out_channels)
+            # Pool between levels (not after the last level)
+            if level < n_levels - 1:
+                self.down_pools.append(AttnPool2x2(C))
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        # --- Up path ---
+        self.up_samples = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
+        for level in range(len(cfg.blocks_up)):
+            self.up_samples.append(Upsample2x(C))
+            n_blocks = cfg.blocks_up[level]
+            ws = cfg.window_size
+            level_blocks = nn.ModuleList()
+            for j in range(n_blocks):
+                shift = 0 if j % 2 == 0 else ws // 2
+                level_blocks.append(CrossAttnAdaLNSwinBlock(
+                    dim=C,
+                    num_heads=cfg.num_heads,
+                    window_size=ws,
+                    shift_size=shift,
+                    mhc_expansion=mhc_expansion,
+                    mhc_sinkhorn_iters=mhc_sinkhorn_iters,
+                ))
+            self.up_blocks.append(level_blocks)
+
+        # Output
+        self.out_norm = RMSNorm(C)
+        self.out_proj = nn.Linear(C, ps * ps * cfg.out_channels)
+
+    def _get_vae_tokens(
+        self,
+        scale_tokens: dict[int, torch.Tensor] | None,
+        vae_scale: int,
+        z: torch.Tensor,
+        B: int,
+    ) -> torch.Tensor:
+        """Get VAE tokens for cross-attention at the given scale.
+
+        For scale 2 (8x8), returns z flattened.
+        For other scales, returns from scale_tokens dict.
+        Falls back to z flattened if scale_tokens is None or scale missing.
         """
-        x_t: (B, 3, 64, 64) 噪声图
-        t:   (B,) 时间
-        z:   (B, 8, 8, latent_dim) 潜在向量 (空间式)
-        返回: (B, 3, 64, 64) 速度场
+        C = z.shape[-1]
+        if vae_scale == 2:
+            return z.reshape(B, -1, C)
+        if scale_tokens is not None and vae_scale in scale_tokens:
+            return scale_tokens[vae_scale]
+        # Fallback: use z
+        return z.reshape(B, -1, C)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        scale_tokens: dict[int, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Forward pass through U-Net decoder.
+
+        Args:
+            x_t: (B, 3, 64, 64) noisy image.
+            t: (B,) timestep.
+            z: (B, 8, 8, latent_dim) latent variable.
+            scale_tokens: dict mapping VAE scale index -> (B, N_s, C) tokens.
+
+        Returns:
+            (B, 3, 64, 64) predicted velocity field.
         """
         B = x_t.shape[0]
 
-        # Patch embed x_t -> (B, 16, 16, embed_dim)
+        # Patch embed x_t -> (B, 16, 16, C)
         h = self.patch_embed(x_t)
 
-        # z 投影 + 上采样 -> (B, 16, 16, embed_dim)
-        z_proj = self.z_proj(z)
-        z_proj = z_proj.permute(0, 3, 1, 2)
-        z_proj = self.z_upsample(z_proj)
-        z_proj = z_proj.permute(0, 2, 3, 1)
-
+        # Time embedding
         t_emb = self.time_embed(t)
 
-        for block in self.blocks:
-            h = block(h, t_emb, z_proj)
+        # === Down path ===
+        skips: list[torch.Tensor] = []
+        for level, blocks in enumerate(self.down_blocks):
+            vae_scale = self.vae_scale_map[level]
+            vae_toks = self._get_vae_tokens(scale_tokens, vae_scale, z, B)
 
+            for block in blocks:
+                h = block(h, t_emb, vae_toks)
+
+            skips.append(h)
+
+            if level < len(self.down_pools):
+                h = self.down_pools[level](h)  # spatial halved
+
+        # === Up path ===
+        # skips has n_levels entries: [L0(16x16), L1(8x8), L2(4x4), L3(2x2), L4(1x1)]
+        # up_levels go from coarse to fine: L3(2x2), L2(4x4), L1(8x8), L0(16x16)
+        for up_level, blocks in enumerate(self.up_blocks):
+            # Corresponding down level (coarse to fine, skipping bottleneck)
+            down_level = len(self.down_blocks) - 2 - up_level  # 3, 2, 1, 0
+            vae_scale = self.vae_scale_map[down_level]
+
+            # Upsample
+            h = self.up_samples[up_level](h)  # spatial doubled
+
+            # Skip connection (addition)
+            h = h + skips[down_level]
+
+            # DiT blocks with cross-attention
+            vae_toks = self._get_vae_tokens(scale_tokens, vae_scale, z, B)
+            for block in blocks:
+                h = block(h, t_emb, vae_toks)
+
+        # === Output ===
         h = self.out_norm(h)
         h = self.out_proj(h)
 
         # Reshape to image via pixel_shuffle
-        ps = self.patch_size
+        ps = self.cfg.patch_size
         h = h.permute(0, 3, 1, 2)
-        h = nn.functional.pixel_shuffle(h, ps)
+        h = F.pixel_shuffle(h, ps)
 
         return h
