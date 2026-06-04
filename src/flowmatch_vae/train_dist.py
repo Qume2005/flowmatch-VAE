@@ -88,7 +88,7 @@ class TrainingWorker:
             total_loss, total_fm, total_kl, n_batches = 0.0, 0.0, 0.0, 0
             epoch_start = time.time()
 
-            for batch_idx, images in enumerate(loader):
+            for batch_idx, (images,) in enumerate(loader):
                 images = images.to(self.device, non_blocking=True)
 
                 losses = model(images)
