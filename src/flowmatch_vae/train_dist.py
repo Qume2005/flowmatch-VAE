@@ -79,15 +79,11 @@ class TrainingWorker:
         # ---- Model (DDP) ----
         local_rank = self.rank % torch.cuda.device_count()
         model = FlowMatchVAE(cfg).to(self.device)
-        # Depthwise Conv1d produces non-contiguous grad strides — harmless,
-        # suppress the DDP warning to keep logs clean.
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Grad strides do not match")
-            model = DDP(
-                model,
-                device_ids=[local_rank],
-                output_device=self.device,
-            )
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=self.device,
+        )
 
         if self.rank == 0:
             n_params = sum(p.numel() for p in model.parameters())
@@ -130,7 +126,10 @@ class TrainingWorker:
 
                 muon_opt.zero_grad()
                 sgd_opt.zero_grad()
-                losses["loss"].backward()
+                # Depthwise Conv1d grad strides mismatch is harmless — suppress
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message="Grad strides do not match")
+                    losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 muon_opt.step()
                 sgd_opt.step()
