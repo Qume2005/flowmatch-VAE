@@ -1,55 +1,51 @@
 import torch
 import torch.nn.functional as F
-from flowmatch_vae.config import Config
+from flowmatch_vae.config import Config, MultiScaleEncoderConfig, MultiScaleDecoderConfig
 from flowmatch_vae.models.vae import FlowMatchVAE
-from flowmatch_vae.models.conv_encoder import SwiGLUConv, RMSNorm2d, AttnPool2x2, apply_2d_rope, FusionAttention, MultiScaleConvEncoder
-from flowmatch_vae.config import MultiScaleEncoderConfig
+from flowmatch_vae.models.conv_encoder import (
+    SwiGLUConv, RMSNorm2d, AttnPool2x2, Upsample2x, MultiScalePrior, MultiScaleConvEncoder,
+)
+from flowmatch_vae.models.decoder import FlowDecoder
 
+
+# ---------------------------------------------------------------------------
+# Module tests
+# ---------------------------------------------------------------------------
 
 def test_rmsnorm2d():
     norm = RMSNorm2d(64)
     x = torch.randn(2, 64, 16, 16)
     out = norm(x)
     assert out.shape == x.shape
-    # Check that output is normalized (RMS ≈ 1 per channel)
     rms = out.pow(2).mean(dim=1, keepdim=True).sqrt()
     assert (rms - 1.0).abs().max() < 0.1
 
 
 def test_swiglu_conv_same_size():
-    """SwiGLUConv preserves spatial dimensions with padding."""
     conv = SwiGLUConv(64, 64, kernel_size=3, dilation=2)
     x = torch.randn(2, 64, 16, 16)
-    out = conv(x)
-    assert out.shape == (2, 64, 16, 16)
+    assert conv(x).shape == (2, 64, 16, 16)
 
 
 def test_swiglu_conv_channel_change():
-    """SwiGLUConv can change channel count."""
     conv = SwiGLUConv(3, 128, kernel_size=3, dilation=1)
     x = torch.randn(2, 3, 64, 64)
-    out = conv(x)
-    assert out.shape == (2, 128, 64, 64)
+    assert conv(x).shape == (2, 128, 64, 64)
 
 
 def test_swiglu_conv_pointwise():
-    """SwiGLUConv with kernel_size=1 works as pointwise."""
     conv = SwiGLUConv(64, 64, kernel_size=1, dilation=1)
     x = torch.randn(2, 64, 4, 4)
-    out = conv(x)
-    assert out.shape == (2, 64, 4, 4)
+    assert conv(x).shape == (2, 64, 4, 4)
 
 
 def test_attn_pool_halves_spatial():
-    """AttnPool2x2 halves H and W."""
     pool = AttnPool2x2(64)
     x = torch.randn(2, 64, 16, 16)
-    out = pool(x)
-    assert out.shape == (2, 64, 8, 8)
+    assert pool(x).shape == (2, 64, 8, 8)
 
 
 def test_attn_pool_weights_sum_to_one():
-    """Attention weights in AttnPool2x2 sum to 1."""
     pool = AttnPool2x2(64)
     x = torch.randn(2, 64, 4, 4)
     B, C, H, W = x.shape
@@ -65,113 +61,164 @@ def test_attn_pool_weights_sum_to_one():
 
 
 def test_attn_pool_grad_flows():
-    """Gradients flow through AttnPool2x2."""
     pool = AttnPool2x2(32)
     x = torch.randn(1, 32, 8, 8, requires_grad=True)
     out = pool(x)
     out.sum().backward()
     assert x.grad is not None
-    assert x.grad.shape == x.shape
 
 
-def test_2d_rope_shape():
-    """2D RoPE preserves tensor shape."""
-    B, N, H, D = 2, 16, 4, 32
-    q = torch.randn(B, N, H, D)
-    y_pos = torch.arange(N, dtype=torch.float)
-    x_pos = torch.arange(N, dtype=torch.float)
-    out = apply_2d_rope(q, y_pos, x_pos)
-    assert out.shape == (B, N, H, D)
+def test_upsample2x():
+    up = Upsample2x(64)
+    x = torch.randn(2, 64, 4, 4)
+    out = up(x)
+    assert out.shape == (2, 64, 8, 8)
 
 
-def test_2d_rope_rotation():
-    """RoPE at position 0 is identity (cos=1, sin=0)."""
-    B, N, H, D = 1, 4, 2, 8
-    q = torch.randn(B, N, H, D)
-    zero_pos = torch.zeros(N)
-    out = apply_2d_rope(q, zero_pos, zero_pos)
-    assert torch.allclose(out, q, atol=1e-5)
-
-
-def test_fusion_attention_shape():
-    """FusionAttention preserves sequence length."""
-    attn = FusionAttention(dim=64, num_heads=4)
-    B, N, C = 2, 100, 64
-    y_pos = torch.arange(N, dtype=torch.float)
-    x_pos = torch.arange(N, dtype=torch.float)
-    out = attn(torch.randn(B, N, C), y_pos, x_pos)
-    assert out.shape == (B, N, C)
-
-
-def test_encoder_output_shape():
-    """Encoder produces mu, logvar of shape (B, 8, 8, C)."""
-    cfg = MultiScaleEncoderConfig()
-    enc = MultiScaleConvEncoder(cfg)
-    x = torch.randn(2, 3, 64, 64)
-    mu, logvar = enc(x)
-    assert mu.shape == (2, 8, 8, 256)
-    assert logvar.shape == (2, 8, 8, 256)
-
-
-def test_encoder_grad_flows():
-    """Gradients flow through the entire encoder."""
-    cfg = MultiScaleEncoderConfig()
-    enc = MultiScaleConvEncoder(cfg)
-    x = torch.randn(1, 3, 64, 64, requires_grad=True)
-    mu, logvar = enc(x)
-    mu.sum().backward()
+def test_upsample2x_grad():
+    up = Upsample2x(32)
+    x = torch.randn(1, 32, 4, 4, requires_grad=True)
+    out = up(x)
+    out.sum().backward()
     assert x.grad is not None
 
 
-def test_encoder_small_config():
-    """Encoder works with minimal layers for fast testing."""
+def test_prior_predicts_scales():
+    prior = MultiScalePrior(256)
+    z = torch.randn(2, 8, 8, 256)
+    tokens = prior(z)
+    assert 1 in tokens and tokens[1].shape == (2, 256, 256)
+    assert 3 in tokens and tokens[3].shape == (2, 16, 256)
+    assert 4 in tokens and tokens[4].shape == (2, 4, 256)
+    assert 5 in tokens and tokens[5].shape == (2, 1, 256)
+    assert 2 not in tokens  # scale 2 = z itself, not predicted
+
+
+def test_encoder_returns_scale_dict():
     cfg = MultiScaleEncoderConfig(
         layers_per_stage=(1, 1, 1, 1, 1, 1),
         dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
     )
     enc = MultiScaleConvEncoder(cfg)
     x = torch.randn(2, 3, 64, 64)
-    mu, logvar = enc(x)
+    mu, logvar, tokens = enc(x)
     assert mu.shape == (2, 8, 8, 256)
+    assert logvar.shape == (2, 8, 8, 256)
+    assert isinstance(tokens, dict)
+    assert 0 in tokens and tokens[0].shape == (2, 1024, 256)
+    assert 2 in tokens and tokens[2].shape == (2, 64, 256)
+    assert 5 in tokens and tokens[5].shape == (2, 1, 256)
 
 
-def test_vae_with_multiscale_encoder():
-    """VAE works end-to-end with multi-scale conv encoder."""
+def test_encoder_grad_flows():
+    cfg = MultiScaleEncoderConfig(
+        layers_per_stage=(1, 1, 1, 1, 1, 1),
+        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+    )
+    enc = MultiScaleConvEncoder(cfg)
+    x = torch.randn(1, 3, 64, 64, requires_grad=True)
+    mu, logvar, tokens = enc(x)
+    mu.sum().backward()
+    assert x.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# Decoder tests
+# ---------------------------------------------------------------------------
+
+def test_decoder_unet_shape():
+    cfg = MultiScaleDecoderConfig(
+        blocks_down=(1, 1, 1, 1, 1),
+        blocks_up=(1, 1, 1, 1),
+    )
+    dec = FlowDecoder(cfg)
+    x_t = torch.randn(2, 3, 64, 64)
+    t = torch.rand(2)
+    z = torch.randn(2, 8, 8, 256)
+    out = dec(x_t, t, z, scale_tokens=None)
+    assert out.shape == (2, 3, 64, 64)
+
+
+def test_decoder_with_scale_tokens():
+    cfg = MultiScaleDecoderConfig(
+        blocks_down=(1, 1, 1, 1, 1),
+        blocks_up=(1, 1, 1, 1),
+    )
+    dec = FlowDecoder(cfg)
+    x_t = torch.randn(2, 3, 64, 64)
+    t = torch.rand(2)
+    z = torch.randn(2, 8, 8, 256)
+    scale_tokens = {
+        1: torch.randn(2, 256, 256),
+        2: z.reshape(2, -1, 256),
+        3: torch.randn(2, 16, 256),
+        4: torch.randn(2, 4, 256),
+        5: torch.randn(2, 1, 256),
+    }
+    out = dec(x_t, t, z, scale_tokens=scale_tokens)
+    assert out.shape == (2, 3, 64, 64)
+
+
+# ---------------------------------------------------------------------------
+# VAE integration tests
+# ---------------------------------------------------------------------------
+
+def _small_config():
     cfg = Config()
     cfg.encoder = MultiScaleEncoderConfig(
         layers_per_stage=(1, 1, 1, 1, 1, 1),
         dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
     )
-    model = FlowMatchVAE(cfg)
+    cfg.decoder = MultiScaleDecoderConfig(
+        blocks_down=(1, 1, 1, 1, 1),
+        blocks_up=(1, 1, 1, 1),
+    )
+    return cfg
+
+
+def test_vae_loss_runs():
+    model = FlowMatchVAE(_small_config())
     x = torch.randn(2, 3, 64, 64)
     losses = model.compute_loss(x)
     assert "loss" in losses
+    assert "fm_loss" in losses
+    assert "kl_loss" in losses
+    assert "prior_loss" in losses
     assert losses["fm_loss"].shape == ()
     assert losses["kl_loss"].shape == ()
+    assert losses["prior_loss"].shape == ()
 
 
-def test_vae_multiscale_sample():
-    """Sampling works with multi-scale encoder."""
-    cfg = Config()
-    cfg.encoder = MultiScaleEncoderConfig(
-        layers_per_stage=(1, 1, 1, 1, 1, 1),
-        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
-    )
-    model = FlowMatchVAE(cfg)
+def test_vae_sample_shape():
+    model = FlowMatchVAE(_small_config())
     model.eval()
     with torch.no_grad():
         x_recon = model.sample(num_samples=2, num_steps=4, device="cpu")
     assert x_recon.shape == (2, 3, 64, 64)
 
 
+def test_vae_encode_shape():
+    model = FlowMatchVAE(_small_config())
+    x = torch.randn(2, 3, 64, 64)
+    mu, logvar, tokens = model.encode(x)
+    assert mu.shape == (2, 8, 8, 256)
+    assert logvar.shape == (2, 8, 8, 256)
+    z = model.reparameterize(mu, logvar)
+    assert z.shape == (2, 8, 8, 256)
+
+
+def test_vae_reconstruct():
+    model = FlowMatchVAE(_small_config())
+    model.eval()
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        x_recon = model.reconstruct(x, num_steps=4)
+    assert x_recon.shape == (2, 3, 64, 64)
+
+
 def test_end_to_end_overfit_single_batch():
     """Overfit on a single batch to verify the full training loop."""
-    cfg = Config()
-    cfg.encoder = MultiScaleEncoderConfig(
-        layers_per_stage=(1, 1, 1, 1, 1, 1),
-        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
-    )
-    cfg.decoder.depth = 1
+    cfg = _small_config()
     model = FlowMatchVAE(cfg)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
