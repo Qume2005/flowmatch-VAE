@@ -133,3 +133,32 @@ def test_encoder_small_config():
     x = torch.randn(2, 3, 64, 64)
     mu, logvar = enc(x)
     assert mu.shape == (2, 8, 8, 256)
+
+
+def test_vae_with_multiscale_encoder():
+    """VAE works end-to-end with multi-scale conv encoder."""
+    cfg = Config()
+    cfg.encoder = MultiScaleEncoderConfig(
+        layers_per_stage=(1, 1, 1, 1, 1, 1),
+        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+    )
+    model = FlowMatchVAE(cfg)
+    x = torch.randn(2, 3, 64, 64)
+    losses = model.compute_loss(x)
+    assert "loss" in losses
+    assert losses["fm_loss"].shape == ()
+    assert losses["kl_loss"].shape == ()
+
+
+def test_vae_multiscale_sample():
+    """Sampling works with multi-scale encoder."""
+    cfg = Config()
+    cfg.encoder = MultiScaleEncoderConfig(
+        layers_per_stage=(1, 1, 1, 1, 1, 1),
+        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+    )
+    model = FlowMatchVAE(cfg)
+    model.eval()
+    with torch.no_grad():
+        x_recon = model.sample(num_samples=2, num_steps=4, device="cpu")
+    assert x_recon.shape == (2, 3, 64, 64)
