@@ -168,6 +168,10 @@ def prepare_data(cfg: Config):
 
 
 def main():
+    # 堵住 Ray 内部守护进程的日志噪音
+    os.environ["RAY_LOG_TO_STDERR"] = "0"
+    os.environ["RAY_DEDUP_LOGS_AGGRESSIVE"] = "1"
+
     cfg = Config()
     # 解析成绝对路径，避免 Ray worker 的 CWD 不是项目根目录
     cfg.train.data_path = os.path.abspath(cfg.train.data_path)
