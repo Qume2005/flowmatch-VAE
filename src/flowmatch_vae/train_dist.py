@@ -182,7 +182,7 @@ def main():
     prepare_data(cfg)
 
     import logging
-    ray.init(logging_level=logging.ERROR, log_to_driver=False)
+    ray.init(logging_level=logging.ERROR)
 
     trainer = TorchTrainer(
         train_loop_per_worker=train_func,
