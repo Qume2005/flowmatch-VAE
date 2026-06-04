@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 
@@ -121,7 +122,7 @@ def train(cfg: Config | None = None):
                 "model_state_dict": model.state_dict(),
                 "muon_state_dict": muon_opt.state_dict(),
                 "sgd_state_dict": sgd_opt.state_dict(),
-                "config": cfg,
+                "config": dataclasses.asdict(cfg),
             }, path)
             print(f"Saved checkpoint: {path}")
 

@@ -1,6 +1,8 @@
+import dataclasses
+
 import torch
 import torch.nn.functional as F
-from flowmatch_vae.config import Config, MultiScaleEncoderConfig, MultiScaleDecoderConfig
+from flowmatch_vae.config import Config, MultiScaleEncoderConfig, MultiScaleDecoderConfig, MoEConfig
 from flowmatch_vae.models.vae import FlowMatchVAE
 from flowmatch_vae.models.conv_encoder import (
     SwiGLUConv, RMSNorm2d, AttnPool2x2, Upsample2x, MultiScalePrior, MultiScaleConvEncoder,
@@ -234,3 +236,184 @@ def test_end_to_end_overfit_single_batch():
         optimizer.step()
 
     assert losses["fm_loss"].item() < 2.0, f"FM loss should decrease, got {losses['fm_loss'].item()}"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint save / load tests
+# ---------------------------------------------------------------------------
+
+def _moe_config():
+    """Small config with MoE enabled (conv + DiT experts)."""
+    cfg = Config()
+    cfg.encoder = MultiScaleEncoderConfig(
+        num_conv_blocks=1,
+        dilations=(1,),
+    )
+    cfg.decoder = MultiScaleDecoderConfig(
+        blocks_down=(1, 1, 1, 1, 1),
+        blocks_up=(1, 1, 1, 1),
+        moe=MoEConfig(num_experts=2),
+    )
+    return cfg
+
+
+def test_checkpoint_roundtrip_no_moe():
+    """Save and load a checkpoint without MoE — outputs must match."""
+    cfg = _small_config()
+    model = FlowMatchVAE(cfg)
+    model.eval()
+
+    state = model.state_dict()
+
+    # Load into a fresh model
+    model2 = FlowMatchVAE(cfg)
+    model2.load_state_dict(state)
+    model2.eval()
+
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        mu1, lv1, _ = model.encode(x)
+        mu2, lv2, _ = model2.encode(x)
+
+    assert torch.allclose(mu1, mu2, atol=1e-5), "mu mismatch after load_state_dict"
+    assert torch.allclose(lv1, lv2, atol=1e-5), "logvar mismatch after load_state_dict"
+
+
+def test_checkpoint_roundtrip_with_moe():
+    """Save and load a checkpoint with MoE enabled — outputs must match."""
+    cfg = _moe_config()
+    model = FlowMatchVAE(cfg)
+    model.eval()
+
+    state = model.state_dict()
+
+    model2 = FlowMatchVAE(cfg)
+    model2.load_state_dict(state)
+    model2.eval()
+
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        mu1, lv1, _ = model.encode(x)
+        mu2, lv2, _ = model2.encode(x)
+
+    assert torch.allclose(mu1, mu2, atol=1e-5), "mu mismatch after load_state_dict (MoE)"
+    assert torch.allclose(lv1, lv2, atol=1e-5), "logvar mismatch after load_state_dict (MoE)"
+
+
+def test_checkpoint_roundtrip_full_forward_with_moe():
+    """Full forward pass (compute_loss) with MoE — outputs must match after save/load."""
+    cfg = _moe_config()
+    model = FlowMatchVAE(cfg)
+    model.eval()
+
+    state = model.state_dict()
+
+    model2 = FlowMatchVAE(cfg)
+    model2.load_state_dict(state)
+    model2.eval()
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 64, 64)
+
+    with torch.no_grad():
+        # Use deterministic z for comparison (disable reparameterization randomness)
+        torch.manual_seed(42)
+        out1 = model(x)
+        torch.manual_seed(42)
+        out2 = model2(x)
+
+    assert torch.allclose(out1["fm_loss"], out2["fm_loss"], atol=1e-5), \
+        f"fm_loss mismatch: {out1['fm_loss'].item()} vs {out2['fm_loss'].item()}"
+    assert torch.allclose(out1["kl_loss"], out2["kl_loss"], atol=1e-5), \
+        f"kl_loss mismatch: {out1['kl_loss'].item()} vs {out2['kl_loss'].item()}"
+
+
+def test_checkpoint_file_roundtrip_with_moe():
+    """Full file-based checkpoint save/load cycle (matches train.py -> sample.py path)."""
+    import tempfile
+    from flowmatch_vae.sample import load_model
+
+    cfg = _moe_config()
+    model = FlowMatchVAE(cfg)
+    model.eval()
+
+    # Save exactly like train.py / train_dist.py
+    ckpt = {
+        "epoch": 1,
+        "model_state_dict": model.state_dict(),
+        "config": dataclasses.asdict(cfg),
+    }
+
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        torch.save(ckpt, f.name)
+        path = f.name
+
+    # Load exactly like sample.py
+    model2, cfg_loaded = load_model(path, device="cpu")
+
+    # Verify MoE config was reconstructed correctly
+    assert isinstance(cfg_loaded.decoder.moe, MoEConfig), \
+        f"Expected MoEConfig, got {type(cfg_loaded.decoder.moe)}"
+    assert cfg_loaded.decoder.moe.num_experts == 2
+    assert cfg_loaded.decoder.moe.routing_mode == "soft"
+
+    # Verify outputs match
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        mu1, lv1, _ = model.encode(x)
+        mu2, lv2, _ = model2.encode(x)
+
+    assert torch.allclose(mu1, mu2, atol=1e-5), "mu mismatch after file roundtrip"
+    assert torch.allclose(lv1, lv2, atol=1e-5), "logvar mismatch after file roundtrip"
+
+    import os
+    os.unlink(path)
+
+
+def test_shared_params_in_state_dict():
+    """Shared encoder/decoder parameters should have identical values after load."""
+    cfg = _small_config()
+    model = FlowMatchVAE(cfg)
+    model.eval()
+
+    sd = model.state_dict()
+
+    model2 = FlowMatchVAE(cfg)
+    model2.load_state_dict(sd)
+
+    # Verify shared conv blocks hold the same parameter object
+    assert model2.encoder.conv_blocks[0] is model2.decoder.shared_convs[0]
+    assert model2.encoder.conv_blocks[0] is model2.decoder.up_samples[0].refine
+    # Verify shared pool
+    assert model2.encoder.pool is model2.decoder.shared_pool
+
+
+def test_checkpoint_preserves_mhc_config():
+    """mhc config section must be correctly restored from checkpoint."""
+    import tempfile
+    from flowmatch_vae.sample import load_model
+
+    cfg = Config()
+    cfg.encoder = MultiScaleEncoderConfig(num_conv_blocks=1, dilations=(1,))
+    cfg.decoder = MultiScaleDecoderConfig(blocks_down=(1,1,1,1,1), blocks_up=(1,1,1,1))
+    cfg.mhc.expansion_rate = 8
+    cfg.mhc.sinkhorn_iters = 10
+
+    ckpt = {
+        "epoch": 1,
+        "model_state_dict": FlowMatchVAE(cfg).state_dict(),
+        "config": dataclasses.asdict(cfg),
+    }
+
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        torch.save(ckpt, f.name)
+        path = f.name
+
+    _, cfg_loaded = load_model(path, device="cpu")
+    assert cfg_loaded.mhc.expansion_rate == 8, \
+        f"Expected mhc.expansion_rate=8, got {cfg_loaded.mhc.expansion_rate}"
+    assert cfg_loaded.mhc.sinkhorn_iters == 10, \
+        f"Expected mhc.sinkhorn_iters=10, got {cfg_loaded.mhc.sinkhorn_iters}"
+
+    import os
+    os.unlink(path)

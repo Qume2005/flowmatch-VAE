@@ -8,6 +8,7 @@ Ctrl+C 触发优雅停止: 保存 checkpoint → 跑 benchmark → 退出。
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import socket
 import tempfile
@@ -152,7 +153,7 @@ class TrainingWorker:
                     "model_state_dict": model.module.state_dict(),
                     "muon_state_dict": muon_opt.state_dict(),
                     "sgd_state_dict": sgd_opt.state_dict(),
-                    "config": cfg,
+                    "config": dataclasses.asdict(cfg),
                 }, path)
 
                 if n_batches > 0:

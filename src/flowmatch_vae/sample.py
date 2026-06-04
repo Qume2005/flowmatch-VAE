@@ -12,19 +12,60 @@ from flowmatch_vae.config import Config
 from flowmatch_vae.models.vae import FlowMatchVAE
 
 
+def _restore_nested_config(section_cfg, section_dict):
+    """Recursively restore nested dataclass fields from plain dicts.
+
+    When ``dataclasses.asdict()`` serialises a config, nested dataclasses
+    (e.g. ``MoEConfig`` inside ``MultiScaleDecoderConfig``) become plain
+    dicts.  This helper walks the fields of *section_cfg* and converts
+    any dict value whose field type is (or contains) a dataclass back into
+    an instance.
+    """
+    import types
+    from dataclasses import fields, is_dataclass
+
+    for f in fields(section_cfg):
+        if f.name not in section_dict:
+            continue
+        value = section_dict[f.name]
+        if not isinstance(value, dict):
+            setattr(section_cfg, f.name, value)
+            continue
+
+        # Collect candidate types from the annotation (may be a Union like
+        # ``MoEConfig | None``).  We try each non-NoneType candidate.
+        candidates = []
+        ftype = f.type
+        if isinstance(ftype, types.UnionType):
+            candidates = [a for a in ftype.__args__ if a is not type(None)]
+        elif is_dataclass(ftype):
+            candidates = [ftype]
+
+        restored = False
+        for cls in candidates:
+            if is_dataclass(cls):
+                try:
+                    setattr(section_cfg, f.name, cls(**value))
+                    restored = True
+                    break
+                except TypeError:
+                    pass
+
+        if not restored:
+            # Not a known dataclass — store the dict as-is (or scalar).
+            setattr(section_cfg, f.name, value)
+
+
 def load_model(checkpoint_path: str, device: str = "cpu") -> tuple[FlowMatchVAE, Config]:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    # Config 存为 dict 以支持 weights_only=True
+    # Config stored as dict to support weights_only=True
     cfg_dict = ckpt["config"]
     if isinstance(cfg_dict, dict):
-        from dataclasses import fields
         cfg = Config()
-        for section_name in ("encoder", "decoder", "train"):
+        for section_name in ("encoder", "decoder", "mhc", "train"):
             section_cfg = getattr(cfg, section_name)
             section_dict = cfg_dict.get(section_name, {})
-            for f in fields(section_cfg):
-                if f.name in section_dict:
-                    setattr(section_cfg, f.name, section_dict[f.name])
+            _restore_nested_config(section_cfg, section_dict)
     else:
         cfg = cfg_dict
     model = FlowMatchVAE(cfg).to(device)
