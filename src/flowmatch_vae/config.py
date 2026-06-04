@@ -60,6 +60,26 @@ class DecoderConfig:
 
 
 @dataclass
+class MultiScaleDecoderConfig:
+    """U-Net multi-scale OT-CFM velocity network configuration.
+
+    Decoder operates at 5 levels (16x16 down to 1x1) with DiT blocks
+    at each level doing cross-attention to VAE encoder features.
+    """
+    out_channels: int = 3
+    patch_size: int = 4
+    embed_dim: int = 256
+    # Blocks per level in down path (5 levels: 16x16 -> 8x8 -> 4x4 -> 2x2 -> 1x1)
+    blocks_down: tuple[int, ...] = (2, 2, 1, 1, 1)
+    # Blocks per level in up path (4 levels: 2x2 -> 4x4 -> 8x8 -> 16x16)
+    blocks_up: tuple[int, ...] = (1, 1, 2, 2)
+    num_heads: int = 8
+    window_size: int = 4
+    latent_spatial_size: int = 8
+    latent_dim: int = 256
+
+
+@dataclass
 class mHCConfig:
     """Manifold-constrained Hyper-Connections configuration.
 
@@ -86,11 +106,12 @@ class TrainConfig:
     log_dir: str = "./logs"
     sample_interval: int = 5
     save_interval: int = 20
+    prior_weight: float = 0.1
 
 
 @dataclass
 class Config:
     encoder: MultiScaleEncoderConfig = field(default_factory=MultiScaleEncoderConfig)
-    decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    decoder: MultiScaleDecoderConfig = field(default_factory=MultiScaleDecoderConfig)
     mhc: mHCConfig = field(default_factory=mHCConfig)
     train: TrainConfig = field(default_factory=TrainConfig)

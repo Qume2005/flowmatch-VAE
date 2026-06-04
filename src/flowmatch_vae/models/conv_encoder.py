@@ -342,8 +342,8 @@ class MultiScaleConvEncoder(nn.Module):
             scale_lengths.append(h * w)
         return torch.cat(all_y), torch.cat(all_x), scale_lengths
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """x: (B, 3, 64, 64) -> mu: (B, 8, 8, C), logvar: (B, 8, 8, C)"""
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
+        """x: (B, 3, 64, 64) -> mu: (B, 8, 8, C), logvar: (B, 8, 8, C), per_scale_tokens"""
         B = x.shape[0]
         C = self.cfg.embed_dim
 
@@ -380,15 +380,104 @@ class MultiScaleConvEncoder(nn.Module):
         # Fusion self-attention
         fused = self.fusion(all_tokens, y_pos, x_pos)  # (B, total_N, C)
 
-        # Extract scale-2 (8x8 = 64) tokens
-        latent_scale = self.cfg.latent_scale_idx
-        start = sum(scale_lengths[:latent_scale])
-        end = start + scale_lengths[latent_scale]
-        latent_tokens = fused[:, start:end, :]  # (B, 64, C)
+        # Extract per-scale tokens from fused sequence
+        per_scale_tokens: dict[int, torch.Tensor] = {}
+        offset = 0
+        for s_idx, slen in enumerate(scale_lengths):
+            per_scale_tokens[s_idx] = fused[:, offset:offset + slen, :]
+            offset += slen
 
+        # Extract scale-2 tokens for mu/logvar (keep old logic for compatibility)
+        latent_scale = self.cfg.latent_scale_idx
+        latent_tokens = per_scale_tokens[latent_scale]
         Hi, Wi = spatial_sizes[latent_scale]
         latent_tokens = latent_tokens.reshape(B, Hi, Wi, C)
 
         mu = self.mu_head(latent_tokens)
         logvar = self.logvar_head(latent_tokens)
-        return mu, logvar
+        return mu, logvar, per_scale_tokens
+
+
+# ---------------------------------------------------------------------------
+# Upsample2x — nearest upsample + SwiGLUConv refinement
+# ---------------------------------------------------------------------------
+
+class Upsample2x(nn.Module):
+    """Nearest-neighbor 2x upsample followed by SwiGLUConv refinement."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        self.refine = SwiGLUConv(dim, dim, kernel_size=3, dilation=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, C, H, W) -> (B, C, H*2, W*2)"""
+        return self.refine(self.up(x))
+
+
+# ---------------------------------------------------------------------------
+# MultiScalePrior — predict multi-scale features from z
+# ---------------------------------------------------------------------------
+
+class MultiScalePrior(nn.Module):
+    """Predict multi-scale VAE encoder features from z for generation.
+
+    Takes z at 8x8 resolution and predicts features at scales 1, 3, 4, 5
+    (scale 2 = z itself, no prediction needed).
+
+    Args:
+        dim: Channel dimension.
+    """
+
+    def __init__(self, dim: int = 256):
+        super().__init__()
+        # z (8x8) -> scale 1 (16x16): upsample 2x
+        self.to_16 = nn.Sequential(
+            nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1),
+            RMSNorm2d(dim),
+            SwiGLUConv(dim, dim, kernel_size=3, dilation=1),
+        )
+        # z (8x8) -> scale 3 (4x4): pool 2x
+        self.to_4 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1),
+            RMSNorm2d(dim),
+            SwiGLUConv(dim, dim, kernel_size=3, dilation=1),
+        )
+        # scale 3 (4x4) -> scale 4 (2x2): pool 2x
+        self.to_2 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1),
+            RMSNorm2d(dim),
+            SwiGLUConv(dim, dim, kernel_size=3, dilation=1),
+        )
+        # scale 4 (2x2) -> scale 5 (1x1): pool 2x
+        self.to_1 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1),
+            RMSNorm2d(dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> dict[int, torch.Tensor]:
+        """z: (B, 8, 8, C) in channels-last format.
+
+        Returns dict mapping scale index -> (B, N_s, C) tokens:
+            1: (B, 256, C)   — 16x16
+            3: (B, 16, C)    — 4x4
+            4: (B, 4, C)     — 2x2
+            5: (B, 1, C)     — 1x1
+        """
+        z_bchw = z.permute(0, 3, 1, 2)  # (B, C, 8, 8)
+
+        f_16 = self.to_16(z_bchw)  # (B, C, 16, 16)
+        f_4 = self.to_4(z_bchw)    # (B, C, 4, 4)
+        f_2 = self.to_2(f_4)       # (B, C, 2, 2)
+        f_1 = self.to_1(f_2)       # (B, C, 1, 1)
+
+        def to_tokens(feat):
+            B, C, H, W = feat.shape
+            return feat.permute(0, 2, 3, 1).reshape(B, H * W, C)
+
+        return {
+            1: to_tokens(f_16),
+            3: to_tokens(f_4),
+            4: to_tokens(f_2),
+            5: to_tokens(f_1),
+        }
