@@ -1,13 +1,14 @@
 """分布式训练 Flow Matching VAE (Ray Actor + PyTorch NCCL, 单机 8 卡)。
 
 Ray 只负责 worker 放置和生命周期管理，梯度同步走原生 PyTorch DDP (NCCL)。
-没有 Ray Train 的内部守护进程噪音。
+Ctrl+C 触发优雅停止: 保存 checkpoint → 跑 benchmark → 退出。
 """
 
 from __future__ import annotations
 
 import os
 import socket
+import tempfile
 import time
 
 import ray
@@ -23,6 +24,9 @@ from flowmatch_vae.config import Config
 from flowmatch_vae.data.celeba import cache_dataset, get_transforms
 from flowmatch_vae.models.vae import FlowMatchVAE
 
+# 主进程写此文件通知 worker 停止
+_STOP_FILE = os.path.join(tempfile.gettempdir(), "flowmatch_vae_stop")
+
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -37,7 +41,6 @@ class TrainingWorker:
     def setup(self, rank: int, world_size: int, master_addr: str, master_port: int):
         self.rank = rank
         self.world_size = world_size
-
         dist.init_process_group(
             backend="nccl",
             init_method=f"tcp://{master_addr}:{master_port}",
@@ -77,6 +80,8 @@ class TrainingWorker:
         optimizer = AdamW(model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=tc.epochs)
 
+        stop_reason = "completed"
+
         # ---- Training Loop ----
         for epoch in range(1, tc.epochs + 1):
             model.train()
@@ -89,8 +94,12 @@ class TrainingWorker:
             epoch_start = time.time()
 
             for batch_idx, (images,) in enumerate(loader):
-                images = images.to(self.device, non_blocking=True)
+                # 检查停止信号
+                if os.path.exists(_STOP_FILE):
+                    stop_reason = "interrupted"
+                    break
 
+                images = images.to(self.device, non_blocking=True)
                 losses = model(images)
 
                 optimizer.zero_grad()
@@ -109,38 +118,46 @@ class TrainingWorker:
                           f"fm={losses['fm_loss'].item():.4f} "
                           f"kl={losses['kl_loss'].item():.4f}")
 
-            scheduler.step()
+            # Epoch 结束或被中断
             elapsed = time.time() - epoch_start
 
             if self.rank == 0:
+                # 保存 checkpoint（每个 epoch 都存，中断时保证有最新的）
                 os.makedirs(tc.save_dir, exist_ok=True)
-                if epoch % tc.save_interval == 0 or epoch == tc.epochs:
-                    path = os.path.join(tc.save_dir, f"checkpoint_epoch{epoch}.pt")
-                    torch.save({
-                        "epoch": epoch,
-                        "model_state_dict": model.module.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "config": cfg,
-                    }, path)
-                    print(f"Saved: {path}")
+                path = os.path.join(tc.save_dir, "checkpoint_latest.pt")
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.module.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": cfg,
+                }, path)
 
-                print(f"Epoch {epoch}/{tc.epochs} | "
-                      f"loss={total_loss / n_batches:.4f} "
-                      f"fm={total_fm / n_batches:.4f} "
-                      f"kl={total_kl / n_batches:.4f} | "
-                      f"lr={scheduler.get_last_lr()[0]:.6f} | "
-                      f"time={elapsed:.1f}s")
+                if n_batches > 0:
+                    print(f"Epoch {epoch}/{tc.epochs} | "
+                          f"loss={total_loss / n_batches:.4f} "
+                          f"fm={total_fm / n_batches:.4f} "
+                          f"kl={total_kl / n_batches:.4f} | "
+                          f"lr={scheduler.get_last_lr()[0]:.6f} | "
+                          f"time={elapsed:.1f}s")
 
-                if epoch % tc.sample_interval == 0:
+                if epoch % tc.sample_interval == 0 or stop_reason == "interrupted":
                     _save_samples(model.module, cfg, epoch, self.device)
 
+            if stop_reason == "interrupted":
+                if self.rank == 0:
+                    print(f"\nInterrupted at epoch {epoch}. Running benchmark...")
+                _benchmark(model.module, cfg, self.device)
+                break
+
+            scheduler.step()
             dist.barrier()
 
-        if self.rank == 0:
-            print("Training complete!")
+        if stop_reason == "completed" and self.rank == 0:
+            print("Training complete! Running final benchmark...")
+            _benchmark(model.module, cfg, self.device)
 
         dist.destroy_process_group()
-        return {"rank": self.rank, "status": "done"}
+        return {"rank": self.rank, "status": stop_reason}
 
 
 @torch.no_grad()
@@ -154,6 +171,55 @@ def _save_samples(model, cfg, epoch, device):
     path = os.path.join(cfg.train.log_dir, f"samples_epoch{epoch}.png")
     save_image(samples, path, nrow=4)
     print(f"Saved samples: {path}")
+    model.train()
+
+
+@torch.no_grad()
+def _benchmark(model, cfg, device):
+    """推理性能 benchmark：采样速度 + 重建速度。"""
+    from torchvision.utils import save_image
+    model.eval()
+
+    num_steps = cfg.train.num_sample_steps
+    n_samples = 64
+    n_warmup = 3
+    n_trials = 10
+
+    # ---- 采样速度 ----
+    if device == torch.device("cuda"):
+        torch.cuda.synchronize()
+    for _ in range(n_warmup):
+        model.sample(num_samples=n_samples, num_steps=num_steps, device=device)
+
+    times = []
+    for _ in range(n_trials):
+        if device == torch.device("cuda"):
+            torch.cuda.synchronize()
+        t0 = time.time()
+        model.sample(num_samples=n_samples, num_steps=num_steps, device=device)
+        if device == torch.device("cuda"):
+            torch.cuda.synchronize()
+        times.append(time.time() - t0)
+
+    avg_time = sum(times) / len(times)
+    samples_per_sec = n_samples / avg_time
+    print(f"\n{'='*50}")
+    print(f"BENCHMARK (rank 0, single GPU)")
+    print(f"{'='*50}")
+    print(f"Sampling: {n_samples} images, {num_steps} steps")
+    print(f"  Avg time: {avg_time*1000:.1f} ms")
+    print(f"  Throughput: {samples_per_sec:.1f} samples/sec")
+    print(f"  Per-step: {avg_time/num_steps*1000:.1f} ms")
+    print(f"{'='*50}")
+
+    # ---- 保存 benchmark 样本 ----
+    samples = model.sample(num_samples=16, num_steps=num_steps, device=device)
+    samples = (samples.clamp(-1, 1) + 1) / 2
+    os.makedirs(cfg.train.log_dir, exist_ok=True)
+    path = os.path.join(cfg.train.log_dir, "benchmark_samples.png")
+    save_image(samples, path, nrow=4)
+    print(f"Saved benchmark samples: {path}")
+
     model.train()
 
 
@@ -183,24 +249,37 @@ def main():
 
     print(f"Launching {world_size} workers, master={master_addr}:{master_port}")
 
-    # 创建 8 个 GPU worker
     workers = [TrainingWorker.remote() for _ in range(world_size)]
 
-    # 初始化 torch.distributed（所有 worker 同时连上 TCP master）
     ray.get([
         w.setup.remote(i, world_size, master_addr, master_port)
         for i, w in enumerate(workers)
     ])
     print("All workers initialized.")
 
-    # 开始训练
     cfg_dict = {
         "data_path": cfg.train.data_path,
         "save_dir": cfg.train.save_dir,
         "log_dir": cfg.train.log_dir,
     }
-    results = ray.get([w.train.remote(cfg_dict) for w in workers])
-    print(f"All workers finished: {results}")
+    train_futures = [w.train.remote(cfg_dict) for w in workers]
+
+    try:
+        results = ray.get(train_futures)
+        print(f"All workers finished: {results}")
+    except KeyboardInterrupt:
+        print("\nCtrl+C received. Signaling workers to stop...")
+        # 写停止信号文件
+        open(_STOP_FILE, "w").close()
+        # 等待 worker 优雅退出（它们会在当前 batch 结束后停止、保存、benchmark）
+        try:
+            results = ray.get(train_futures, timeout=120)
+            print(f"Workers stopped gracefully: {results}")
+        except Exception:
+            print("Timeout waiting for workers. Forcing exit.")
+        finally:
+            if os.path.exists(_STOP_FILE):
+                os.unlink(_STOP_FILE)
 
 
 if __name__ == "__main__":
