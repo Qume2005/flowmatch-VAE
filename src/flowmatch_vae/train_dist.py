@@ -75,6 +75,7 @@ class TrainingWorker:
         )
 
         # ---- Model (DDP) ----
+        local_rank = self.rank % torch.cuda.device_count()
         model = FlowMatchVAE(cfg).to(self.device)
         model = DDP(
             model,
