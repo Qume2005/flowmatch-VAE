@@ -55,7 +55,8 @@ class FlowDecoder(nn.Module):
             index.  Defaults to [1, 2, 3, 4, 5] for the standard 64x64 layout.
     """
 
-    def __init__(self, cfg, mhc_cfg=None, vae_scale_map: list[int] | None = None, latent_vae_scale: int = 2):
+    def __init__(self, cfg, mhc_cfg=None, vae_scale_map: list[int] | None = None, latent_vae_scale: int = 2,
+                 shared_convs: nn.ModuleList | None = None, shared_pool: AttnPool2x2 | None = None):
         super().__init__()
         self.cfg = cfg
         C = cfg.embed_dim
@@ -75,6 +76,10 @@ class FlowDecoder(nn.Module):
         # Time embedding
         self.time_embed = SinusoidalTimeEmbedding(C)
 
+        # Shared modules from encoder
+        self.shared_convs = shared_convs  # ModuleList of SwiGLUConv from encoder
+        self.shared_pool = shared_pool    # AttnPool2x2 from encoder
+
         # Decoder levels (from fine to coarse): 16x16, 8x8, 4x4, 2x2, 1x1
         # Map to VAE encoder scale indices
         self.vae_scale_map = vae_scale_map or [1, 2, 3, 4, 5]
@@ -82,9 +87,14 @@ class FlowDecoder(nn.Module):
         self._latent_vae_scale = latent_vae_scale
         n_levels = len(cfg.blocks_down)
 
+        # Fallback: create separate pools if shared_pool is not provided
+        if self.shared_pool is None:
+            self.down_pools = nn.ModuleList()
+            for level in range(n_levels - 1):
+                self.down_pools.append(AttnPool2x2(C))
+
         # --- Down path ---
         self.down_blocks = nn.ModuleList()
-        self.down_pools = nn.ModuleList()
         for level in range(n_levels):
             n_blocks = cfg.blocks_down[level]
             # Window size: use cfg.window_size for larger levels, min(H,W) for small
@@ -102,15 +112,13 @@ class FlowDecoder(nn.Module):
                 ))
             self.down_blocks.append(level_blocks)
 
-            # Pool between levels (not after the last level)
-            if level < n_levels - 1:
-                self.down_pools.append(AttnPool2x2(C))
-
         # --- Up path ---
         self.up_samples = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         for level in range(len(cfg.blocks_up)):
-            self.up_samples.append(Upsample2x(C))
+            # Use first shared conv (dilation=1) for Upsample2x refinement
+            up_conv = self.shared_convs[0] if self.shared_convs is not None else None
+            self.up_samples.append(Upsample2x(C, shared_conv=up_conv))
             n_blocks = cfg.blocks_up[level]
             ws = cfg.window_size
             level_blocks = nn.ModuleList()
@@ -179,7 +187,7 @@ class FlowDecoder(nn.Module):
 
         # === Down path ===
         # h is (B, H, W, C) from PatchEmbed; DiT blocks use same format.
-        # AttnPool2x2 expects (B, C, H, W), so convert before/after pool.
+        # Shared convs expect (B, C, H, W), AttnPool2x2 also expects (B, C, H, W).
         skips: list[torch.Tensor] = []
         spatial_h = h.shape[1]
         spatial_w = h.shape[2]
@@ -187,15 +195,25 @@ class FlowDecoder(nn.Module):
             vae_scale = self.vae_scale_map[level]
             vae_toks = self._get_vae_tokens(scale_tokens, vae_scale, z, B)
 
+            # Apply shared convs (B, H, W, C) -> (B, C, H, W) -> convs -> (B, H, W, C)
+            if self.shared_convs is not None:
+                h = h.permute(0, 3, 1, 2)              # (B, C, H, W)
+                for conv in self.shared_convs:
+                    h = conv(h)                          # (B, C, H, W)
+                h = h.permute(0, 2, 3, 1)               # (B, H, W, C)
+
             for block in blocks:
                 h = block(h, t_emb, vae_toks)  # (B, H, W, C)
 
             skips.append(h)
 
-            if level < len(self.down_pools):
-                h = h.permute(0, 3, 1, 2)          # (B, C, H, W)
-                h = self.down_pools[level](h)        # (B, C, H/2, W/2)
-                h = h.permute(0, 2, 3, 1)           # (B, H/2, W/2, C)
+            if level < len(self.down_blocks) - 1:
+                h = h.permute(0, 3, 1, 2)              # (B, C, H, W)
+                if self.shared_pool is not None:
+                    h = self.shared_pool(h)              # (B, C, H/2, W/2)
+                else:
+                    h = self.down_pools[level](h)        # (B, C, H/2, W/2)
+                h = h.permute(0, 2, 3, 1)               # (B, H/2, W/2, C)
                 spatial_h //= 2
                 spatial_w //= 2
 

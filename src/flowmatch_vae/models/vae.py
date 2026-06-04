@@ -78,10 +78,15 @@ class FlowMatchVAE(nn.Module):
 
         # Decoder
         if isinstance(cfg.decoder, MultiScaleDecoderConfig):
+            # Pass shared encoder modules to decoder when using multi-scale encoder
+            shared_convs = self.encoder.conv_blocks if isinstance(cfg.encoder, MultiScaleEncoderConfig) else None
+            shared_pool = self.encoder.pool if isinstance(cfg.encoder, MultiScaleEncoderConfig) else None
             self.decoder = FlowDecoder(
                 cfg.decoder, mhc_cfg=cfg.mhc,
                 vae_scale_map=vae_scale_map,
                 latent_vae_scale=latent_vae_scale,
+                shared_convs=shared_convs,
+                shared_pool=shared_pool,
             )
         else:
             self.decoder = FlowDecoder(cfg.decoder, mhc_cfg=cfg.mhc)

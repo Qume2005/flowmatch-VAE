@@ -427,10 +427,13 @@ class MultiScaleConvEncoder(nn.Module):
 class Upsample2x(nn.Module):
     """Nearest-neighbor 2x upsample followed by SwiGLUConv refinement."""
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, shared_conv: SwiGLUConv | None = None):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
-        self.refine = SwiGLUConv(dim, dim, kernel_size=3, dilation=1)
+        if shared_conv is not None:
+            self.refine = shared_conv
+        else:
+            self.refine = SwiGLUConv(dim, dim, kernel_size=3, dilation=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, C, H, W) -> (B, C, H*2, W*2)"""
