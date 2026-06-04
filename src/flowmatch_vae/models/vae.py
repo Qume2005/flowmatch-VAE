@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,20 +28,66 @@ class FlowMatchVAE(nn.Module):
         # Encoder
         if isinstance(cfg.encoder, MultiScaleEncoderConfig):
             self.encoder = MultiScaleConvEncoder(cfg.encoder)
+
+            # Compute encoder scale layout for 64x64 input (training default)
+            # The decoder and prior need to know the scale indices.
+            n_stages = MultiScaleConvEncoder._compute_num_stages(cfg.train.image_size)
+            spatial_sizes = []
+            s = cfg.train.image_size
+            for _ in range(n_stages):
+                s //= 2
+                spatial_sizes.append((s, s))
+
+            # Find latent scale index
+            self.latent_scale_idx = MultiScaleConvEncoder._find_latent_scale(
+                spatial_sizes, cfg.encoder.latent_spatial_size
+            )
+
+            # Build vae_scale_map for decoder:
+            # Decoder has 5 levels (16x16 -> 8x8 -> 4x4 -> 2x2 -> 1x1),
+            # which correspond to encoder scales with spatial sizes
+            # [image_size/4, image_size/8, image_size/16, image_size/32, image_size/64].
+            # Map each decoder level to the encoder scale with matching spatial size.
+            decoder_target_sizes = [
+                cfg.train.image_size // (2 ** (i + 2))
+                for i in range(len(cfg.decoder.blocks_down))
+            ]
+            vae_scale_map = []
+            for target in decoder_target_sizes:
+                for s_idx, (h, w) in enumerate(spatial_sizes):
+                    if h == target and w == target:
+                        vae_scale_map.append(s_idx)
+                        break
+                else:
+                    # Fallback: use sequential indices
+                    vae_scale_map.append(len(vae_scale_map))
+
+            latent_vae_scale = self.latent_scale_idx
+
+            # Prior: predict all scales except the latent
+            prior = MultiScalePrior(
+                dim=cfg.encoder.embed_dim,
+                latent_spatial_size=cfg.encoder.latent_spatial_size,
+                spatial_sizes=spatial_sizes,
+            )
         else:
             self.encoder = SwinEncoder(cfg.encoder, mhc_cfg=cfg.mhc)
+            vae_scale_map = [1, 2, 3, 4, 5]
+            latent_vae_scale = 2
+            prior = None
 
         # Decoder
         if isinstance(cfg.decoder, MultiScaleDecoderConfig):
-            self.decoder = FlowDecoder(cfg.decoder, mhc_cfg=cfg.mhc)
+            self.decoder = FlowDecoder(
+                cfg.decoder, mhc_cfg=cfg.mhc,
+                vae_scale_map=vae_scale_map,
+                latent_vae_scale=latent_vae_scale,
+            )
         else:
             self.decoder = FlowDecoder(cfg.decoder, mhc_cfg=cfg.mhc)
 
         # Prior network (only used with multi-scale encoder)
-        if isinstance(cfg.encoder, MultiScaleEncoderConfig):
-            self.prior = MultiScalePrior(cfg.encoder.embed_dim)
-        else:
-            self.prior = None
+        self.prior = prior
 
     def encode(self, x: torch.Tensor):
         """Encode image to latent space.
@@ -74,22 +122,23 @@ class FlowMatchVAE(nn.Module):
         During eval: use encoder features (reconstruction) -- caller overrides for generation.
 
         Returns:
-            cond_tokens: dict with scale 2 set to z_flat
+            cond_tokens: dict with latent_scale set to z_flat
             prior_loss: MSE loss if prior is used, else None
         """
         B = z.shape[0]
         C = z.shape[-1]
         z_flat = z.reshape(B, -1, C)
+        latent_idx = getattr(self, "latent_scale_idx", 2)
 
         prior_loss = None
 
         if self.prior is not None and len(encoder_tokens) > 0:
             prior_tokens = self.prior(z)
 
-            # Prior loss: predict encoder features
+            # Prior loss: predict encoder features at all non-latent scales
             prior_loss = torch.tensor(0.0, device=z.device)
             for s in prior_tokens:
-                if s in encoder_tokens and s != 2:
+                if s in encoder_tokens and s != latent_idx:
                     prior_loss = prior_loss + F.mse_loss(prior_tokens[s], encoder_tokens[s])
 
             # Random choice during training
@@ -100,8 +149,8 @@ class FlowMatchVAE(nn.Module):
         else:
             cond_tokens = dict(encoder_tokens)
 
-        # Scale 2 is always z
-        cond_tokens[2] = z_flat
+        # Latent scale is always z
+        cond_tokens[latent_idx] = z_flat
 
         return cond_tokens, prior_loss
 
@@ -148,20 +197,25 @@ class FlowMatchVAE(nn.Module):
         device: str = "cpu",
     ) -> torch.Tensor:
         """Sample from prior using predicted multi-scale features."""
+        latent_s = self.cfg.encoder.latent_spatial_size if isinstance(self.cfg.encoder, MultiScaleEncoderConfig) else 8
+        C = self.cfg.encoder.embed_dim if isinstance(self.cfg.encoder, MultiScaleEncoderConfig) else 256
+
         if z is None:
-            z = torch.randn(num_samples, 8, 8, 256, device=device)
+            z = torch.randn(num_samples, latent_s, latent_s, C, device=device)
         else:
             num_samples = z.shape[0]
 
         # Predict multi-scale features from z
-        B, Hz, Wz, C = z.shape
-        z_flat = z.reshape(B, -1, C)
+        B, Hz, Wz, Cz = z.shape
+        z_flat = z.reshape(B, -1, Cz)
+        latent_idx = getattr(self, "latent_scale_idx", 2)
         cond_tokens: dict[int, torch.Tensor] = {}
-        cond_tokens[2] = z_flat
+        cond_tokens[latent_idx] = z_flat
         if self.prior is not None:
             cond_tokens.update(self.prior(z))
 
-        x = torch.randn(num_samples, 3, 64, 64, device=device)
+        image_size = self.cfg.train.image_size
+        x = torch.randn(num_samples, 3, image_size, image_size, device=device)
         dt = 1.0 / num_steps
 
         for i in range(num_steps):

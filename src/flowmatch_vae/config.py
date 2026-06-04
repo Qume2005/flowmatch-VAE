@@ -20,29 +20,26 @@ class EncoderConfig:
 class MultiScaleEncoderConfig:
     """Multi-scale SwiGLU convolution encoder configuration.
 
-    Progressive 2x2 pooling from 64x64 down to 1x1 through 6 stages.
-    Each stage has SwiGLUConv layers followed by AttnPool2x2.
-    All scale features are fused via self-attention with 2D PoPE (Legendre Orthogonal Polynomial Positional Encoding).
+    Adaptive parameter-sharing architecture: a fixed set of SwiGLUConv blocks
+    and a single AttnPool2x2 are reused at every stage.  The number of stages
+    is computed dynamically from the input spatial size (halving until 1x1).
+    All scale features are fused via self-attention with 2D PoPE (Legendre
+    Orthogonal Polynomial Positional Encoding).
     """
     in_channels: int = 3
     embed_dim: int = 256
-    # Number of SwiGLU conv layers per stage (6 stages: 64->32->16->8->4->2->1)
-    layers_per_stage: tuple[int, ...] = (3, 2, 2, 2, 1, 1)
-    # Dilation rates per stage (cycles through if more layers than rates)
-    dilations_per_stage: tuple[tuple[int, ...], ...] = (
-        (1, 2, 3, 4),  # 64x64: multi-scale dilated conv
-        (1,),           # 32x32
-        (1,),           # 16x16
-        (1,),           # 8x8
-        (1,),           # 4x4
-        (1,),           # 2x2
-    )
-    # Kernel size per stage (3 for spatial conv, 1 for pointwise)
-    kernel_sizes_per_stage: tuple[int, ...] = (3, 3, 3, 3, 1, 1)
+    # Number of SwiGLU conv blocks, reused at every stage (parameter sharing)
+    num_conv_blocks: int = 2
+    # Dilation rates cycled through for each conv block
+    dilations: tuple[int, ...] = (1, 2, 3, 4)
+    # Kernel size used for all conv blocks (3 works at any spatial size)
+    kernel_size: int = 3
     # Number of attention heads for fusion
     fusion_heads: int = 8
-    # Which scale index to extract latent from (2 = 8x8, the third pool output)
-    latent_scale_idx: int = 2
+    # Target spatial size for z extraction (e.g. 8 for 8x8 bottleneck)
+    latent_spatial_size: int = 8
+    # Maximum expected input spatial size (used to size scale_embed and PoPE buffers)
+    max_input_size: int = 64
 
 
 @dataclass

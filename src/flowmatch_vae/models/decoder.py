@@ -51,9 +51,11 @@ class FlowDecoder(nn.Module):
     Args:
         cfg: MultiScaleDecoderConfig dataclass.
         mhc_cfg: Optional mHC config for DiT blocks.
+        vae_scale_map: List mapping each decoder level to a VAE encoder scale
+            index.  Defaults to [1, 2, 3, 4, 5] for the standard 64x64 layout.
     """
 
-    def __init__(self, cfg, mhc_cfg=None):
+    def __init__(self, cfg, mhc_cfg=None, vae_scale_map: list[int] | None = None, latent_vae_scale: int = 2):
         super().__init__()
         self.cfg = cfg
         C = cfg.embed_dim
@@ -74,8 +76,10 @@ class FlowDecoder(nn.Module):
         self.time_embed = SinusoidalTimeEmbedding(C)
 
         # Decoder levels (from fine to coarse): 16x16, 8x8, 4x4, 2x2, 1x1
-        # Map to VAE encoder scale indices: 1, 2, 3, 4, 5
-        self.vae_scale_map = [1, 2, 3, 4, 5]  # decoder level -> VAE encoder scale
+        # Map to VAE encoder scale indices
+        self.vae_scale_map = vae_scale_map or [1, 2, 3, 4, 5]
+        # Which VAE encoder scale corresponds to the latent z
+        self._latent_vae_scale = latent_vae_scale
         n_levels = len(cfg.blocks_down)
 
         # --- Down path ---
@@ -135,12 +139,12 @@ class FlowDecoder(nn.Module):
     ) -> torch.Tensor:
         """Get VAE tokens for cross-attention at the given scale.
 
-        For scale 2 (8x8), returns z flattened.
+        For the latent scale (typically 8x8), returns z flattened.
         For other scales, returns from scale_tokens dict.
         Falls back to z flattened if scale_tokens is None or scale missing.
         """
         C = z.shape[-1]
-        if vae_scale == 2:
+        if vae_scale == self._latent_vae_scale:
             return z.reshape(B, -1, C)
         if scale_tokens is not None and vae_scale in scale_tokens:
             return scale_tokens[vae_scale]

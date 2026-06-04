@@ -270,15 +270,19 @@ class FusionAttention(nn.Module):
 class MultiScaleConvEncoder(nn.Module):
     """Multi-scale SwiGLU convolution encoder with attention pooling.
 
+    Adaptive parameter-sharing architecture: a fixed set of SwiGLUConv blocks
+    and a single AttnPool2x2 are reused at every stage.  The number of stages
+    is computed dynamically from the input spatial size (halving until 1x1).
+
     Architecture:
-        Image (B, 3, 64, 64)
+        Image (B, 3, H, W)
           -> stem Conv1x1(3, embed_dim)
-          -> 6 stages: SwiGLUConv x N_i -> AttnPool2x2
-            (64->32->16->8->4->2->1)
-          -> collect features from each scale -> (B, 1365, C)
+          -> n_stages stages: shared SwiGLUConv blocks -> shared AttnPool2x2
+            (H -> H/2 -> ... -> 1)
+          -> collect features from each scale
           -> add scale embeddings + 2D PoPE
-          -> FusionAttention -> extract 8x8 tokens
-          -> mu_head, logvar_head -> (B, 8, 8, C)
+          -> FusionAttention -> extract latent-scale tokens
+          -> mu_head, logvar_head -> (B, latent_spatial, latent_spatial, C)
 
     Args:
         cfg: MultiScaleEncoderConfig dataclass.
@@ -288,7 +292,10 @@ class MultiScaleConvEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         C = cfg.embed_dim
-        self.n_scales = len(cfg.layers_per_stage)
+
+        # Maximum number of scales for scale_embed and PoPE buffers
+        max_scales = int(math.log2(cfg.max_input_size))
+        self.max_scales = max_scales
 
         # Stem: expand channels
         self.stem = nn.Sequential(
@@ -296,52 +303,87 @@ class MultiScaleConvEncoder(nn.Module):
             RMSNorm2d(C),
         )
 
-        # Build stages
-        self.stages = nn.ModuleList()
-        self.pools = nn.ModuleList()
-        for i in range(self.n_scales):
-            n_layers = cfg.layers_per_stage[i]
-            dilations = cfg.dilations_per_stage[i]
-            k = (
-                cfg.kernel_sizes_per_stage[i]
-                if i < len(cfg.kernel_sizes_per_stage)
-                else cfg.kernel_sizes_per_stage[-1]
-            )
-            stage_layers = nn.ModuleList()
-            for j in range(n_layers):
-                d = dilations[j % len(dilations)]
-                stage_layers.append(SwiGLUConv(C, C, kernel_size=k, dilation=d))
-            self.stages.append(stage_layers)
-            self.pools.append(AttnPool2x2(C))
+        # Shared SwiGLU conv blocks (parameter sharing across stages)
+        self.conv_blocks = nn.ModuleList([
+            SwiGLUConv(C, C, kernel_size=cfg.kernel_size, dilation=cfg.dilations[j % len(cfg.dilations)])
+            for j in range(cfg.num_conv_blocks)
+        ])
 
-        # Learnable scale embeddings
-        self.scale_embed = nn.Parameter(torch.randn(self.n_scales, C) * 0.02)
+        # Shared attention pool (single instance, reused at every stage)
+        self.pool = AttnPool2x2(C)
 
-        # Fusion attention (max_h and max_w cover all encoder scales: 32x32 down to 1x1)
-        self.fusion = FusionAttention(C, cfg.fusion_heads, max_h=32, max_w=32)
+        # Learnable scale embeddings (sized for max possible scales)
+        self.scale_embed = nn.Parameter(torch.randn(max_scales, C) * 0.02)
+
+        # Fusion attention (max_h/max_w cover largest scale after first pool)
+        self.fusion = FusionAttention(
+            C, cfg.fusion_heads,
+            max_h=cfg.max_input_size // 2,
+            max_w=cfg.max_input_size // 2,
+        )
 
         # Output heads
         self.mu_head = nn.Linear(C, C)
         self.logvar_head = nn.Linear(C, C)
 
+    @staticmethod
+    def _compute_num_stages(spatial_size: int) -> int:
+        """Compute the number of 2x2-pooling stages to go from spatial_size to 1."""
+        n = 0
+        s = spatial_size
+        while s > 1:
+            s //= 2
+            n += 1
+        return n
+
+    @staticmethod
+    def _find_latent_scale(spatial_sizes: list[tuple[int, int]], latent_spatial_size: int) -> int:
+        """Find which scale index has spatial size == latent_spatial_size.
+
+        Args:
+            spatial_sizes: list of (H, W) tuples for each scale.
+            latent_spatial_size: target spatial size (e.g. 8).
+
+        Returns:
+            Scale index whose spatial dimensions match latent_spatial_size.
+
+        Raises:
+            ValueError: if no scale matches the target size.
+        """
+        for idx, (h, w) in enumerate(spatial_sizes):
+            if h == latent_spatial_size and w == latent_spatial_size:
+                return idx
+        raise ValueError(
+            f"No scale with spatial size {latent_spatial_size} found in "
+            f"{[s for s in spatial_sizes]}"
+        )
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
-        """x: (B, 3, 64, 64) -> mu: (B, 8, 8, C), logvar: (B, 8, 8, C), per_scale_tokens"""
+        """x: (B, 3, H, W) -> mu: (B, latent_s, latent_s, C), logvar, per_scale_tokens"""
         B = x.shape[0]
         C = self.cfg.embed_dim
+        H_in, W_in = x.shape[2], x.shape[3]
 
-        h = self.stem(x)  # (B, C, 64, 64)
+        h = self.stem(x)  # (B, C, H_in, W_in)
+
+        # Compute number of stages dynamically from input spatial size
+        n_stages = self._compute_num_stages(H_in)
+        assert n_stages <= self.max_scales, (
+            f"Input spatial size {H_in} requires {n_stages} stages, "
+            f"but max_scales={self.max_scales} (max_input_size={self.cfg.max_input_size})"
+        )
 
         # Run stages, collect features at each scale
         scale_features: list[torch.Tensor] = []
         spatial_sizes: list[tuple[int, int]] = []
 
-        for i in range(self.n_scales):
-            # SwiGLU conv layers (same-padding preserves spatial size)
-            for layer in self.stages[i]:
-                h = layer(h)
+        for i in range(n_stages):
+            # Apply shared conv blocks sequentially
+            for block in self.conv_blocks:
+                h = block(h)
 
-            # Attention pool 2x2
-            h = self.pools[i](h)  # (B, C, H//2, W//2)
+            # Apply shared attention pool
+            h = self.pool(h)  # (B, C, H//2, W//2)
 
             # Record features (channels-last for token sequence)
             _, _, Hi, Wi = h.shape
@@ -349,13 +391,13 @@ class MultiScaleConvEncoder(nn.Module):
             scale_features.append(h.permute(0, 2, 3, 1).reshape(B, Hi * Wi, C))
 
         # Build multi-scale token sequence with scale embeddings
-        for s in range(self.n_scales):
+        for s in range(n_stages):
             scale_features[s] = scale_features[s] + self.scale_embed[s]
 
         all_tokens = torch.cat(scale_features, dim=1)  # (B, total_N, C)
 
         # Build scale lengths for extracting per-scale tokens later
-        scale_lengths = [h * w for h, w in spatial_sizes]
+        scale_lengths = [hh * ww for hh, ww in spatial_sizes]
 
         # Fusion self-attention (with 2D PoPE)
         fused = self.fusion(all_tokens, spatial_sizes)  # (B, total_N, C)
@@ -367,8 +409,8 @@ class MultiScaleConvEncoder(nn.Module):
             per_scale_tokens[s_idx] = fused[:, offset:offset + slen, :]
             offset += slen
 
-        # Extract scale-2 tokens for mu/logvar (keep old logic for compatibility)
-        latent_scale = self.cfg.latent_scale_idx
+        # Find latent scale dynamically and extract mu/logvar
+        latent_scale = self._find_latent_scale(spatial_sizes, self.cfg.latent_spatial_size)
         latent_tokens = per_scale_tokens[latent_scale]
         Hi, Wi = spatial_sizes[latent_scale]
         latent_tokens = latent_tokens.reshape(B, Hi, Wi, C)
@@ -402,62 +444,81 @@ class Upsample2x(nn.Module):
 class MultiScalePrior(nn.Module):
     """Predict multi-scale VAE encoder features from z for generation.
 
-    Takes z at 8x8 resolution and predicts features at scales 1, 3, 4, 5
-    (scale 2 = z itself, no prediction needed).
+    Takes z at ``latent_spatial_size`` resolution and predicts features at all
+    *other* scales in the encoder's hierarchy.  Scales larger than the latent
+    are reached via ConvTranspose2d (2x upsample), scales smaller via Conv2d
+    stride=2 (2x pool).  Each prediction path includes RMSNorm + SwiGLUConv.
 
     Args:
         dim: Channel dimension.
+        latent_spatial_size: Spatial size of the latent z (e.g. 8 for 8x8).
+        spatial_sizes: Full list of (H, W) spatial sizes produced by the
+            encoder, in order (largest to smallest).  If *None*, defaults to
+            the 64x64-input layout: [(32,32), (16,16), (8,8), (4,4), (2,2), (1,1)].
     """
 
-    def __init__(self, dim: int = 256):
+    def __init__(
+        self,
+        dim: int = 256,
+        latent_spatial_size: int = 8,
+        spatial_sizes: list[tuple[int, int]] | None = None,
+    ):
         super().__init__()
-        # z (8x8) -> scale 1 (16x16): upsample 2x
-        self.to_16 = nn.Sequential(
-            nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1),
-            RMSNorm2d(dim),
-            SwiGLUConv(dim, dim, kernel_size=3, dilation=1),
-        )
-        # z (8x8) -> scale 3 (4x4): pool 2x
-        self.to_4 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1),
-            RMSNorm2d(dim),
-            SwiGLUConv(dim, dim, kernel_size=3, dilation=1),
-        )
-        # scale 3 (4x4) -> scale 4 (2x2): pool 2x
-        self.to_2 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1),
-            RMSNorm2d(dim),
-            SwiGLUConv(dim, dim, kernel_size=3, dilation=1),
-        )
-        # scale 4 (2x2) -> scale 5 (1x1): pool 2x
-        self.to_1 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1),
-            RMSNorm2d(dim),
-        )
+        self.dim = dim
+        self.latent_spatial_size = latent_spatial_size
+
+        # Default to 64x64 -> 6 scales layout
+        if spatial_sizes is None:
+            spatial_sizes = [(32, 32), (16, 16), (8, 8), (4, 4), (2, 2), (1, 1)]
+        self.spatial_sizes = spatial_sizes
+
+        # Identify the latent scale index and build per-scale prediction paths
+        self.latent_scale_idx = None
+        self._paths = nn.ModuleDict()
+
+        for idx, (h, w) in enumerate(spatial_sizes):
+            if h == latent_spatial_size and w == latent_spatial_size:
+                self.latent_scale_idx = idx
+                continue  # z itself, no prediction needed
+
+            name = f"scale_{idx}"
+            if h > latent_spatial_size:
+                # UP path: one or more ConvTranspose2d 2x upsamples
+                n_ups = int(math.log2(h // latent_spatial_size))
+                layers = []
+                for _ in range(n_ups):
+                    layers.append(nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1))
+                    layers.append(RMSNorm2d(dim))
+                    layers.append(SwiGLUConv(dim, dim, kernel_size=3, dilation=1))
+                self._paths[name] = nn.Sequential(*layers)
+            else:
+                # DOWN path: one or more Conv2d stride=2 pools
+                n_downs = int(math.log2(latent_spatial_size // h))
+                layers = []
+                for d in range(n_downs):
+                    layers.append(nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1))
+                    layers.append(RMSNorm2d(dim))
+                self._paths[name] = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> dict[int, torch.Tensor]:
-        """z: (B, 8, 8, C) in channels-last format.
+        """z: (B, latent_s, latent_s, C) in channels-last format.
 
-        Returns dict mapping scale index -> (B, N_s, C) tokens:
-            1: (B, 256, C)   — 16x16
-            3: (B, 16, C)    — 4x4
-            4: (B, 4, C)     — 2x2
-            5: (B, 1, C)     — 1x1
+        Returns dict mapping scale index -> (B, N_s, C) tokens for all
+        scales except the latent scale.
         """
-        z_bchw = z.permute(0, 3, 1, 2)  # (B, C, 8, 8)
+        z_bchw = z.permute(0, 3, 1, 2)  # (B, C, latent_s, latent_s)
 
-        f_16 = self.to_16(z_bchw)  # (B, C, 16, 16)
-        f_4 = self.to_4(z_bchw)    # (B, C, 4, 4)
-        f_2 = self.to_2(f_4)       # (B, C, 2, 2)
-        f_1 = self.to_1(f_2)       # (B, C, 1, 1)
+        result: dict[int, torch.Tensor] = {}
 
-        def to_tokens(feat):
+        def to_tokens(feat: torch.Tensor) -> torch.Tensor:
             B, C, H, W = feat.shape
             return feat.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
-        return {
-            1: to_tokens(f_16),
-            3: to_tokens(f_4),
-            4: to_tokens(f_2),
-            5: to_tokens(f_1),
-        }
+        for idx, (h, w) in enumerate(self.spatial_sizes):
+            if h == self.latent_spatial_size and w == self.latent_spatial_size:
+                continue
+            name = f"scale_{idx}"
+            feat = self._paths[name](z_bchw)
+            result[idx] = to_tokens(feat)
+
+        return result

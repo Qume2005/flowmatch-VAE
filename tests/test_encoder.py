@@ -24,8 +24,8 @@ pytestmark = pytest.mark.skipif(
 def _small_encoder_cfg():
     """Minimal encoder config for fast tests."""
     return MultiScaleEncoderConfig(
-        layers_per_stage=(1, 1, 1, 1, 1, 1),
-        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+        num_conv_blocks=1,
+        dilations=(1,),
     )
 
 
@@ -167,3 +167,44 @@ def test_attn_pool_2x2_cuda():
     assert out.shape == (2, 64, 8, 8), f"Expected (2,64,8,8), got {out.shape}"
     out.sum().backward()
     assert x.grad is not None, "Gradient should flow through AttnPool2x2"
+
+
+# ---------------------------------------------------------------------------
+# test_encoder_adaptive_sizing — encoder adapts to different input sizes
+# ---------------------------------------------------------------------------
+
+
+def test_encoder_adaptive_sizing():
+    """Encoder adapts to 32x32 input with latent_spatial_size=4."""
+    cfg = MultiScaleEncoderConfig(
+        num_conv_blocks=1,
+        dilations=(1,),
+        latent_spatial_size=4,
+        max_input_size=32,
+    )
+    device = torch.device("cuda")
+    encoder = MultiScaleConvEncoder(cfg).to(device)
+    x = torch.randn(2, 3, 32, 32, device=device)
+
+    mu, logvar, per_scale_tokens = encoder(x)
+
+    # 32x32 -> 5 stages: 16x16, 8x8, 4x4, 2x2, 1x1
+    assert mu.shape == (2, 4, 4, 256), f"Expected mu (2,4,4,256), got {mu.shape}"
+    assert logvar.shape == (2, 4, 4, 256), f"Expected logvar (2,4,4,256), got {logvar.shape}"
+    assert set(per_scale_tokens.keys()) == {0, 1, 2, 3, 4}, (
+        f"Expected 5 scales for 32x32 input, got {set(per_scale_tokens.keys())}"
+    )
+
+    # Verify spatial sizes
+    expected_tokens = {
+        0: 256,  # 16x16
+        1: 64,   # 8x8
+        2: 16,   # 4x4  <- latent
+        3: 4,    # 2x2
+        4: 1,    # 1x1
+    }
+    for scale_idx, n_tokens in expected_tokens.items():
+        tok = per_scale_tokens[scale_idx]
+        assert tok.shape == (2, n_tokens, cfg.embed_dim), (
+            f"Scale {scale_idx}: expected (2,{n_tokens},{cfg.embed_dim}), got {tok.shape}"
+        )

@@ -84,20 +84,23 @@ def test_upsample2x_grad():
 
 
 def test_prior_predicts_scales():
-    prior = MultiScalePrior(256)
+    prior = MultiScalePrior(256, latent_spatial_size=8)
     z = torch.randn(2, 8, 8, 256)
     tokens = prior(z)
-    assert 1 in tokens and tokens[1].shape == (2, 256, 256)
-    assert 3 in tokens and tokens[3].shape == (2, 16, 256)
-    assert 4 in tokens and tokens[4].shape == (2, 4, 256)
-    assert 5 in tokens and tokens[5].shape == (2, 1, 256)
+    # Default layout: scales 0(32x32), 1(16x16), 2(8x8=latent), 3(4x4), 4(2x2), 5(1x1)
+    # Prior predicts all except scale 2 (latent)
+    assert 0 in tokens and tokens[0].shape == (2, 1024, 256)  # 32x32
+    assert 1 in tokens and tokens[1].shape == (2, 256, 256)   # 16x16
+    assert 3 in tokens and tokens[3].shape == (2, 16, 256)    # 4x4
+    assert 4 in tokens and tokens[4].shape == (2, 4, 256)     # 2x2
+    assert 5 in tokens and tokens[5].shape == (2, 1, 256)     # 1x1
     assert 2 not in tokens  # scale 2 = z itself, not predicted
 
 
 def test_encoder_returns_scale_dict():
     cfg = MultiScaleEncoderConfig(
-        layers_per_stage=(1, 1, 1, 1, 1, 1),
-        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+        num_conv_blocks=1,
+        dilations=(1,),
     )
     enc = MultiScaleConvEncoder(cfg)
     x = torch.randn(2, 3, 64, 64)
@@ -112,8 +115,8 @@ def test_encoder_returns_scale_dict():
 
 def test_encoder_grad_flows():
     cfg = MultiScaleEncoderConfig(
-        layers_per_stage=(1, 1, 1, 1, 1, 1),
-        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+        num_conv_blocks=1,
+        dilations=(1,),
     )
     enc = MultiScaleConvEncoder(cfg)
     x = torch.randn(1, 3, 64, 64, requires_grad=True)
@@ -166,8 +169,8 @@ def test_decoder_with_scale_tokens():
 def _small_config():
     cfg = Config()
     cfg.encoder = MultiScaleEncoderConfig(
-        layers_per_stage=(1, 1, 1, 1, 1, 1),
-        dilations_per_stage=((1,), (1,), (1,), (1,), (1,), (1,)),
+        num_conv_blocks=1,
+        dilations=(1,),
     )
     cfg.decoder = MultiScaleDecoderConfig(
         blocks_down=(1, 1, 1, 1, 1),
