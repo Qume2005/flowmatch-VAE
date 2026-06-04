@@ -29,7 +29,7 @@ def train_func(config: dict):
     cfg = Config()
     tc = cfg.train
 
-    # 从 Ray config 覆盖参数
+    # 从 Ray config 覆盖参数（含绝对路径）
     for k, v in config.items():
         if hasattr(tc, k):
             setattr(tc, k, v)
@@ -169,13 +169,20 @@ def prepare_data(cfg: Config):
 
 def main():
     cfg = Config()
+    # 解析成绝对路径，避免 Ray worker 的 CWD 不是项目根目录
+    cfg.train.data_path = os.path.abspath(cfg.train.data_path)
+    cfg.train.save_dir = os.path.abspath(cfg.train.save_dir)
+    cfg.train.log_dir = os.path.abspath(cfg.train.log_dir)
+
     prepare_data(cfg)
 
     ray.init()
 
     trainer = TorchTrainer(
         train_loop_per_worker=train_func,
-        train_loop_config={},
+        train_loop_config={"data_path": cfg.train.data_path,
+                           "save_dir": cfg.train.save_dir,
+                           "log_dir": cfg.train.log_dir},
         scaling_config=ScalingConfig(
             num_workers=8,
             use_gpu=True,
