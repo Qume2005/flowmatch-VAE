@@ -151,14 +151,17 @@ class KimiLinearAttention(nn.Module):
         dilation_rates = (1, 2)
         self.dw_conv_q = nn.ModuleList([
             nn.Conv1d(dim, dim, kernel_size=3, padding=d, dilation=d, groups=dim)
+            .to(memory_format=torch.channels_last)
             for d in dilation_rates
         ])
         self.dw_conv_k = nn.ModuleList([
             nn.Conv1d(dim, dim, kernel_size=3, padding=d, dilation=d, groups=dim)
+            .to(memory_format=torch.channels_last)
             for d in dilation_rates
         ])
         self.dw_conv_v = nn.ModuleList([
             nn.Conv1d(dim, dim, kernel_size=3, padding=d, dilation=d, groups=dim)
+            .to(memory_format=torch.channels_last)
             for d in dilation_rates
         ])
         # SwiGLU gating projections for conv branches
@@ -362,6 +365,7 @@ class SwiGLUFFN(nn.Module):
         # Multi-scale dilated depthwise convolutions on the up-projected path.
         self.dw_branches = nn.ModuleList([
             nn.Conv1d(hidden, hidden, kernel_size=3, padding=d, dilation=d, groups=hidden)
+            .to(memory_format=torch.channels_last)
             for d in dilation_rates
         ])
 
