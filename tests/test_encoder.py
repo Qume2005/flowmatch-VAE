@@ -116,18 +116,18 @@ def test_encoder_scale_tokens_shapes():
 
 
 def test_fusion_attention():
-    """FusionAttention produces correct output shape with 2D RoPE."""
+    """FusionAttention produces correct output shape with 2D PoPE."""
     device = torch.device("cuda")
     dim = 64
     num_heads = 4
     B, N = 2, 32
 
-    fusion = FusionAttention(dim, num_heads=num_heads).to(device)
+    fusion = FusionAttention(dim, num_heads=num_heads, max_h=8, max_w=8).to(device)
     x = torch.randn(B, N, dim, device=device)
-    y_pos = torch.arange(N, device=device, dtype=torch.float)
-    x_pos = torch.arange(N, device=device, dtype=torch.float)
+    # Use a spatial grid that sums to N=32 tokens: 4x8
+    spatial_sizes = [(4, 8)]
 
-    out = fusion(x, y_pos, x_pos)
+    out = fusion(x, spatial_sizes)
 
     assert out.shape == (B, N, dim), f"Expected ({B},{N},{dim}), got {out.shape}"
 
@@ -138,12 +138,11 @@ def test_fusion_attention_gradient():
     dim = 64
     B, N = 1, 16
 
-    fusion = FusionAttention(dim, num_heads=4).to(device)
+    fusion = FusionAttention(dim, num_heads=4, max_h=4, max_w=4).to(device)
     x = torch.randn(B, N, dim, device=device, requires_grad=True)
-    y_pos = torch.arange(N, device=device, dtype=torch.float)
-    x_pos = torch.arange(N, device=device, dtype=torch.float)
+    spatial_sizes = [(4, 4)]
 
-    out = fusion(x, y_pos, x_pos)
+    out = fusion(x, spatial_sizes)
     out.sum().backward()
 
     assert x.grad is not None, "Input gradient should not be None"

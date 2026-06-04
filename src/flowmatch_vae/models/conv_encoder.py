@@ -4,7 +4,7 @@ Replaces the Swin Transformer encoder with a progressive multi-scale
 convolution architecture:
 - SwiGLU-gated depthwise separable convolutions with dilation
 - mHC-inspired attention pooling (AttnPool2x2)
-- 2D RoPE position encoding for multi-scale token sequences
+- 2D PoPE (Legendre Orthogonal Polynomial) positional encoding for multi-scale tokens
 - Linear self-attention fusion across scales
 """
 
@@ -15,6 +15,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from flowmatch_vae.models.swin import PoPE2D
 
 
 # ---------------------------------------------------------------------------
@@ -148,75 +150,21 @@ class AttnPool2x2(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 2D Rotary Position Embedding
-# ---------------------------------------------------------------------------
-
-def apply_2d_rope(
-    q: torch.Tensor,
-    y_pos: torch.Tensor,
-    x_pos: torch.Tensor,
-) -> torch.Tensor:
-    """Apply 2D RoPE to a (B, N, H, D) tensor.
-
-    First D/2 dimensions get y-position rotation.
-    Last D/2 dimensions get x-position rotation.
-
-    Args:
-        q: (B, N, H, D) query or key tensor.
-        y_pos: (N,) y-coordinate per token.
-        x_pos: (N,) x-coordinate per token.
-
-    Returns:
-        (B, N, H, D) with rotations applied.
-    """
-    B, N, H, D = q.shape
-    half = D // 2
-    quarter = half // 2
-
-    # Base frequencies: 1 / (10000^(2i/d))
-    freqs = 1.0 / (
-        10000 ** (torch.arange(0, quarter, device=q.device, dtype=q.dtype) / quarter)
-    )
-
-    # --- Y rotation (first half of D) ---
-    angles_y = y_pos.to(device=q.device, dtype=q.dtype)[:, None] * freqs[None, :]  # (N, quarter)
-    cos_y = angles_y.cos()[None, :, None, :]  # (1, N, 1, quarter)
-    sin_y = angles_y.sin()[None, :, None, :]
-
-    q_y = q[..., :half].reshape(B, N, H, quarter, 2)
-    q_y0 = q_y[..., 0]  # (B, N, H, quarter)
-    q_y1 = q_y[..., 1]
-    new_y0 = q_y0 * cos_y - q_y1 * sin_y
-    new_y1 = q_y0 * sin_y + q_y1 * cos_y
-    q_y_rot = torch.stack([new_y0, new_y1], dim=-1).reshape(B, N, H, half)
-
-    # --- X rotation (second half of D) ---
-    angles_x = x_pos.to(device=q.device, dtype=q.dtype)[:, None] * freqs[None, :]  # (N, quarter)
-    cos_x = angles_x.cos()[None, :, None, :]  # (1, N, 1, quarter)
-    sin_x = angles_x.sin()[None, :, None, :]
-
-    q_x = q[..., half:].reshape(B, N, H, quarter, 2)
-    q_x0 = q_x[..., 0]
-    q_x1 = q_x[..., 1]
-    new_x0 = q_x0 * cos_x - q_x1 * sin_x
-    new_x1 = q_x0 * sin_x + q_x1 * cos_x
-    q_x_rot = torch.stack([new_x0, new_x1], dim=-1).reshape(B, N, H, half)
-
-    return torch.cat([q_y_rot, q_x_rot], dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# FusionAttention — linear self-attention with 2D RoPE
+# FusionAttention — linear self-attention with 2D PoPE
 # ---------------------------------------------------------------------------
 
 class FusionAttention(nn.Module):
-    """Bidirectional linear attention with 2D RoPE for multi-scale fusion.
+    """Bidirectional linear attention with 2D PoPE for multi-scale fusion.
 
     Simple linear attention (no DW conv, no forget gate) — O(N*d^2) complexity
     suitable for fusing ~1365 multi-scale tokens.
+
+    PoPE (Legendre Orthogonal Polynomial Positional Encoding) is applied
+    additively to the input before QKV projection, not multiplicatively into
+    Q/K after projection like RoPE.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8):
+    def __init__(self, dim: int, num_heads: int = 8, max_h: int = 32, max_w: int = 32):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -226,25 +174,31 @@ class FusionAttention(nn.Module):
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
+        # 2D PoPE: additive positional encoding applied before QKV projection
+        self.pope = PoPE2D(dim, max_h, max_w)
+
     def forward(
         self,
         x: torch.Tensor,
-        y_pos: torch.Tensor,
-        x_pos: torch.Tensor,
+        spatial_sizes: list[tuple[int, int]],
     ) -> torch.Tensor:
         """
-        x: (B, N, C)   y_pos: (N,)   x_pos: (N,)
+        x: (B, N, C)  — concatenated multi-scale tokens
+        spatial_sizes: [(h0, w0), (h1, w1), ...] per scale
+
         Returns: (B, N, C)
         """
         B, N, C = x.shape
         H, D = self.num_heads, self.head_dim
 
+        # Add PoPE positional encoding (additive, before QKV projection)
+        # We apply it to the full token sequence in one shot by building the
+        # combined spatial PE for all scales.
+        x = self._add_multi_scale_pope(x, spatial_sizes)
+
         q = self.q_proj(x).view(B, N, H, D)
         k = self.k_proj(x).view(B, N, H, D)
         v = self.v_proj(x).view(B, N, H, D)
-
-        q = apply_2d_rope(q, y_pos, x_pos)
-        k = apply_2d_rope(k, y_pos, x_pos)
 
         # L2 normalise
         q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
@@ -257,6 +211,56 @@ class FusionAttention(nn.Module):
         # Normalise per head
         o = o / (o.norm(dim=-1, keepdim=True) + 1e-6) * (D ** 0.5)
         return self.out_proj(o.reshape(B, N, C))
+
+    def _add_multi_scale_pope(
+        self,
+        tokens: torch.Tensor,
+        spatial_sizes: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        """Add 2D PoPE to a concatenated multi-scale token sequence.
+
+        For each scale, compute the PoPE encoding for its (h, w) spatial
+        grid and apply it to the corresponding slice of the token sequence.
+
+        Args:
+            tokens: (B, N_total, C) concatenated tokens.
+            spatial_sizes: [(h0, w0), ...] per scale.
+
+        Returns:
+            (B, N_total, C) with PoPE added.
+        """
+        B, N_total, C = tokens.shape
+        half = C // 2
+
+        out = tokens
+        offset = 0
+        for h, w in spatial_sizes:
+            n = h * w
+            # Get scale slice
+            scale_slice = out[:, offset:offset + n, :]
+
+            # Build PE for this scale
+            rows = torch.arange(h, device=tokens.device)
+            cols = torch.arange(w, device=tokens.device)
+
+            pe_y = self.pope.pe_h[rows]  # (h, half)
+            pe_x = self.pope.pe_w[cols]  # (w, half)
+
+            pe_y_exp = pe_y.unsqueeze(1).expand(h, w, half)  # (h, w, half)
+            pe_x_exp = pe_x.unsqueeze(0).expand(h, w, half)  # (h, w, half)
+            pe_2d = torch.cat([pe_y_exp, pe_x_exp], dim=-1)  # (h, w, C)
+            pe_flat = pe_2d.reshape(n, C)  # (n, C)
+
+            # Add PE to this scale's tokens
+            out = torch.cat([
+                out[:, :offset, :],
+                scale_slice + pe_flat.unsqueeze(0),
+                out[:, offset + n:, :],
+            ], dim=1)
+
+            offset += n
+
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +276,7 @@ class MultiScaleConvEncoder(nn.Module):
           -> 6 stages: SwiGLUConv x N_i -> AttnPool2x2
             (64->32->16->8->4->2->1)
           -> collect features from each scale -> (B, 1365, C)
-          -> add scale embeddings + 2D RoPE
+          -> add scale embeddings + 2D PoPE
           -> FusionAttention -> extract 8x8 tokens
           -> mu_head, logvar_head -> (B, 8, 8, C)
 
@@ -313,34 +317,12 @@ class MultiScaleConvEncoder(nn.Module):
         # Learnable scale embeddings
         self.scale_embed = nn.Parameter(torch.randn(self.n_scales, C) * 0.02)
 
-        # Fusion attention
-        self.fusion = FusionAttention(C, cfg.fusion_heads)
+        # Fusion attention (max_h and max_w cover all encoder scales: 32x32 down to 1x1)
+        self.fusion = FusionAttention(C, cfg.fusion_heads, max_h=32, max_w=32)
 
         # Output heads
         self.mu_head = nn.Linear(C, C)
         self.logvar_head = nn.Linear(C, C)
-
-    def _build_scale_positions(
-        self, spatial_sizes: list[tuple[int, int]], device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-        """Build y/x position arrays for 2D RoPE across all scales.
-
-        Returns:
-            y_pos: (total_N,) y-coordinate per token
-            x_pos: (total_N,) x-coordinate per token
-            scale_lengths: [N_0, N_1, ...] token count per scale
-        """
-        all_y: list[torch.Tensor] = []
-        all_x: list[torch.Tensor] = []
-        scale_lengths: list[int] = []
-        for h, w in spatial_sizes:
-            ys = torch.arange(h, device=device, dtype=torch.float)
-            xs = torch.arange(w, device=device, dtype=torch.float)
-            gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-            all_y.append(gy.reshape(-1))
-            all_x.append(gx.reshape(-1))
-            scale_lengths.append(h * w)
-        return torch.cat(all_y), torch.cat(all_x), scale_lengths
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
         """x: (B, 3, 64, 64) -> mu: (B, 8, 8, C), logvar: (B, 8, 8, C), per_scale_tokens"""
@@ -372,13 +354,11 @@ class MultiScaleConvEncoder(nn.Module):
 
         all_tokens = torch.cat(scale_features, dim=1)  # (B, total_N, C)
 
-        # Build position arrays for 2D RoPE
-        y_pos, x_pos, scale_lengths = self._build_scale_positions(
-            spatial_sizes, x.device,
-        )
+        # Build scale lengths for extracting per-scale tokens later
+        scale_lengths = [h * w for h, w in spatial_sizes]
 
-        # Fusion self-attention
-        fused = self.fusion(all_tokens, y_pos, x_pos)  # (B, total_N, C)
+        # Fusion self-attention (with 2D PoPE)
+        fused = self.fusion(all_tokens, spatial_sizes)  # (B, total_N, C)
 
         # Extract per-scale tokens from fused sequence
         per_scale_tokens: dict[int, torch.Tensor] = {}

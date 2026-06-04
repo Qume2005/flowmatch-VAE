@@ -707,6 +707,123 @@ class AdaLNSwinBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# PoPE2D — 2D Legendre Orthogonal Polynomial Positional Encoding
+# ---------------------------------------------------------------------------
+
+class PoPE2D(nn.Module):
+    """2D Legendre Orthogonal Polynomial Positional Encoding (PoPE).
+
+    Uses Legendre polynomials of increasing order evaluated at equidistant
+    points in [-1, 1] to produce positional encodings.  The encoding is
+    **additive** — it is added to token embeddings before QKV projection
+    (unlike RoPE which multiplies into Q/K after projection).
+
+    For 2D spatial data, the head dimension is split in half:
+      - First D//2 dimensions encode the row (y) position
+      - Last  D//2 dimensions encode the column (x) position
+
+    Legendre polynomials are precomputed as buffers (no learnable params):
+      P_0(x) = 1,  P_1(x) = x
+      P_{n+1}(x) = ((2n+1) * x * P_n(x) - n * P_{n-1}(x)) / (n+1)
+
+    For position *pos* with *max_pos* total positions, the evaluation points
+    are ``x_i = -1 + 2*i / (D//2 - 1)`` for ``i in range(D//2)``, and the
+    encoding value at each point is the Legendre polynomial of order *pos*
+    evaluated at that point.
+
+    Args:
+        dim: Token or head dimension C (or head_dim D).
+        max_h: Maximum number of row positions.
+        max_w: Maximum number of column positions.
+    """
+
+    def __init__(self, dim: int, max_h: int, max_w: int):
+        super().__init__()
+        self.dim = dim
+        self.max_h = max_h
+        self.max_w = max_w
+        half = dim // 2
+
+        # Precompute Legendre polynomial encodings for y and x positions
+        pe_h = self._build_legendre_pe(max_h, half)  # (max_h, half)
+        pe_w = self._build_legendre_pe(max_w, half)  # (max_w, half)
+
+        self.register_buffer("pe_h", pe_h, persistent=False)
+        self.register_buffer("pe_w", pe_w, persistent=False)
+
+    @staticmethod
+    def _build_legendre_pe(max_pos: int, n_dims: int) -> torch.Tensor:
+        """Build Legendre polynomial positional encoding.
+
+        For each position *p* in ``[0, max_pos)``, compute the Legendre
+        polynomial of order *p* at ``n_dims`` equidistant points in [-1, 1].
+
+        Returns:
+            (max_pos, n_dims) tensor of Legendre polynomial values.
+        """
+        # Clamp order to avoid numerical issues with very high orders
+        # (in practice max_pos is small: at most ~32 for 32x32 scale)
+        x = torch.linspace(-1.0, 1.0, n_dims)  # (n_dims,)
+
+        pe = torch.zeros(max_pos, n_dims)
+
+        if max_pos >= 1:
+            pe[0] = 1.0  # P_0(x) = 1
+        if max_pos >= 2:
+            pe[1] = x    # P_1(x) = x
+        for n in range(2, max_pos):
+            # P_n(x) = ((2*(n-1)+1) * x * P_{n-1}(x) - (n-1) * P_{n-2}(x)) / n
+            pe[n] = ((2 * (n - 1) + 1) * x * pe[n - 1] - (n - 1) * pe[n - 2]) / n
+
+        return pe
+
+    def forward(self, tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """Add 2D Legendre polynomial positional encoding to tokens.
+
+        Args:
+            tokens: (B, N, C) where N = h*w, or (B, N, heads, head_dim).
+            h: Number of rows.
+            w: Number of columns.
+
+        Returns:
+            Same shape as input, with positional encoding added.
+        """
+        assert h <= self.max_h and w <= self.max_w, (
+            f"Spatial size ({h}, {w}) exceeds PoPE2D max ({self.max_h}, {self.max_w})"
+        )
+
+        half = self.dim // 2
+
+        # Build position indices for each spatial location
+        rows = torch.arange(h, device=tokens.device)  # (h,)
+        cols = torch.arange(w, device=tokens.device)  # (w,)
+
+        # (h, half) and (w, half) — lookup Legendre values per position
+        pe_y = self.pe_h[rows]  # (h, half)
+        pe_x = self.pe_w[cols]  # (w, half)
+
+        # Build full 2D encoding: for each (row, col), concatenate y-encoding and x-encoding
+        # pe_y[row] -> (half,), pe_x[col] -> (half,)
+        # Result: (h, w, dim)
+        pe_y_exp = pe_y.unsqueeze(1).expand(h, w, half)  # (h, w, half)
+        pe_x_exp = pe_x.unsqueeze(0).expand(h, w, half)  # (h, w, half)
+        pe_2d = torch.cat([pe_y_exp, pe_x_exp], dim=-1)  # (h, w, dim)
+
+        # Reshape to match tokens: (h*w, dim)
+        pe_flat = pe_2d.reshape(h * w, self.dim)
+
+        # Add to tokens — handle both (B, N, C) and (B, N, H, D) formats
+        if tokens.dim() == 3:
+            # (B, N, C)
+            return tokens + pe_flat.unsqueeze(0)
+        elif tokens.dim() == 4:
+            # (B, N, heads, head_dim)
+            return tokens + pe_flat.unsqueeze(0).unsqueeze(2)
+        else:
+            raise ValueError(f"PoPE2D expects 3D or 4D tokens, got {tokens.dim()}D")
+
+
+# ---------------------------------------------------------------------------
 # PatchEmbed / PatchMerge
 # ---------------------------------------------------------------------------
 

@@ -22,7 +22,7 @@ class MultiScaleEncoderConfig:
 
     Progressive 2x2 pooling from 64x64 down to 1x1 through 6 stages.
     Each stage has SwiGLUConv layers followed by AttnPool2x2.
-    All scale features are fused via self-attention with 2D RoPE.
+    All scale features are fused via self-attention with 2D PoPE (Legendre Orthogonal Polynomial Positional Encoding).
     """
     in_channels: int = 3
     embed_dim: int = 256
