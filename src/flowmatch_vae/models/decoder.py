@@ -21,7 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from flowmatch_vae.models.swin import PatchEmbed, CrossAttnAdaLNSwinBlock, RMSNorm
-from flowmatch_vae.models.conv_encoder import AttnPool2x2, Upsample2x
+from flowmatch_vae.models.conv_encoder import AttnPool2x2, Upsample2x, SwiGLUConv
+from flowmatch_vae.models.moe import MoEConvLayer, MoEDiTLayer
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -53,10 +54,13 @@ class FlowDecoder(nn.Module):
         mhc_cfg: Optional mHC config for DiT blocks.
         vae_scale_map: List mapping each decoder level to a VAE encoder scale
             index.  Defaults to [1, 2, 3, 4, 5] for the standard 64x64 layout.
+        encoder_dilations: Dilation rates from the encoder's shared convs.
+            Required when cfg.moe is set with moe_conv=True.
     """
 
     def __init__(self, cfg, mhc_cfg=None, vae_scale_map: list[int] | None = None, latent_vae_scale: int = 2,
-                 shared_convs: nn.ModuleList | None = None, shared_pool: AttnPool2x2 | None = None):
+                 shared_convs: nn.ModuleList | None = None, shared_pool: AttnPool2x2 | None = None,
+                 encoder_dilations: tuple[int, ...] | None = None):
         super().__init__()
         self.cfg = cfg
         C = cfg.embed_dim
@@ -93,11 +97,14 @@ class FlowDecoder(nn.Module):
             for level in range(n_levels - 1):
                 self.down_pools.append(AttnPool2x2(C))
 
-        # --- Down path ---
+        # MoE config
+        moe_cfg = getattr(cfg, "moe", None)
+        self._use_moe = moe_cfg is not None
+
+        # --- Down path: standard blocks (always created for backward compat) ---
         self.down_blocks = nn.ModuleList()
         for level in range(n_levels):
             n_blocks = cfg.blocks_down[level]
-            # Window size: use cfg.window_size for larger levels, min(H,W) for small
             ws = cfg.window_size
             level_blocks = nn.ModuleList()
             for j in range(n_blocks):
@@ -111,6 +118,57 @@ class FlowDecoder(nn.Module):
                     mhc_sinkhorn_iters=mhc_sinkhorn_iters,
                 ))
             self.down_blocks.append(level_blocks)
+
+        # --- Down path: MoE conv layers ---
+        if self._use_moe and moe_cfg.moe_conv:
+            self.moe_conv_layers = nn.ModuleList()
+            dilations = encoder_dilations or (1,)
+            for i in range(len(self.shared_convs) if self.shared_convs else 0):
+                d = dilations[i % len(dilations)]
+                # Read kernel_size from the shared conv
+                ks = self.shared_convs[i].kernel_size
+                self.moe_conv_layers.append(MoEConvLayer(
+                    in_channels=C,
+                    out_channels=C,
+                    kernel_size=ks,
+                    dilation=d,
+                    num_experts=moe_cfg.num_experts,
+                    include_zero_expert=moe_cfg.include_zero_expert,
+                    gate_hidden_dim=moe_cfg.gate_hidden_dim,
+                    routing_mode=moe_cfg.routing_mode,
+                    prob_threshold=moe_cfg.prob_threshold,
+                    top_k=moe_cfg.top_k,
+                ))
+        else:
+            self.moe_conv_layers = None
+
+        # --- Down path: MoE DiT blocks ---
+        if self._use_moe and moe_cfg.moe_dit:
+            self.moe_down_blocks = nn.ModuleList()
+            for level in range(n_levels):
+                n_blocks = cfg.blocks_down[level]
+                ws = cfg.window_size
+                level_blocks = nn.ModuleList()
+                for j in range(n_blocks):
+                    shift = 0 if j % 2 == 0 else ws // 2
+                    level_blocks.append(MoEDiTLayer(
+                        dim=C,
+                        num_heads=cfg.num_heads,
+                        window_size=ws,
+                        shift_size=shift,
+                        num_experts=moe_cfg.num_experts,
+                        include_zero_expert=moe_cfg.include_zero_expert,
+                        gate_hidden_dim=moe_cfg.gate_hidden_dim,
+                        routing_mode=moe_cfg.routing_mode,
+                        prob_threshold=moe_cfg.prob_threshold,
+                        top_k=moe_cfg.top_k,
+                        z_dim=C,
+                        mhc_expansion=mhc_expansion,
+                        mhc_sinkhorn_iters=mhc_sinkhorn_iters,
+                    ))
+                self.moe_down_blocks.append(level_blocks)
+        else:
+            self.moe_down_blocks = None
 
         # --- Up path ---
         self.up_samples = nn.ModuleList()
@@ -186,24 +244,28 @@ class FlowDecoder(nn.Module):
         t_emb = self.time_embed(t)
 
         # === Down path ===
-        # h is (B, H, W, C) from PatchEmbed; DiT blocks use same format.
-        # Shared convs expect (B, C, H, W), AttnPool2x2 also expects (B, C, H, W).
         skips: list[torch.Tensor] = []
-        spatial_h = h.shape[1]
-        spatial_w = h.shape[2]
-        for level, blocks in enumerate(self.down_blocks):
+        use_moe_conv = self.moe_conv_layers is not None
+        use_moe_dit = self.moe_down_blocks is not None
+
+        for level in range(len(self.down_blocks)):
             vae_scale = self.vae_scale_map[level]
             vae_toks = self._get_vae_tokens(scale_tokens, vae_scale, z, B)
 
-            # Apply shared convs (B, H, W, C) -> (B, C, H, W) -> convs -> (B, H, W, C)
-            if self.shared_convs is not None:
-                h = h.permute(0, 3, 1, 2)              # (B, C, H, W)
+            # Apply convs: MoE or shared
+            h_bchw = h.permute(0, 3, 1, 2)              # (B, C, H, W)
+            if use_moe_conv:
+                for moe_conv in self.moe_conv_layers:
+                    h_bchw = moe_conv(h_bchw, t_emb)
+            elif self.shared_convs is not None:
                 for conv in self.shared_convs:
-                    h = conv(h)                          # (B, C, H, W)
-                h = h.permute(0, 2, 3, 1)               # (B, H, W, C)
+                    h_bchw = conv(h_bchw)
+            h = h_bchw.permute(0, 2, 3, 1)               # (B, H, W, C)
 
+            # Apply DiT blocks: MoE or standard
+            blocks = self.moe_down_blocks[level] if use_moe_dit else self.down_blocks[level]
             for block in blocks:
-                h = block(h, t_emb, vae_toks)  # (B, H, W, C)
+                h = block(h, t_emb, vae_toks)
 
             skips.append(h)
 
@@ -214,18 +276,12 @@ class FlowDecoder(nn.Module):
                 else:
                     h = self.down_pools[level](h)        # (B, C, H/2, W/2)
                 h = h.permute(0, 2, 3, 1)               # (B, H/2, W/2, C)
-                spatial_h //= 2
-                spatial_w //= 2
 
         # === Up path ===
-        # skips has n_levels entries: [L0(16x16), L1(8x8), L2(4x4), L3(2x2), L4(1x1)]
-        # up_levels go from coarse to fine: L3(2x2), L2(4x4), L1(8x8), L0(16x16)
         for up_level, blocks in enumerate(self.up_blocks):
-            # Corresponding down level (coarse to fine, skipping bottleneck)
-            down_level = len(self.down_blocks) - 2 - up_level  # 3, 2, 1, 0
+            down_level = len(self.down_blocks) - 2 - up_level
             vae_scale = self.vae_scale_map[down_level]
 
-            # Upsample: convert to (B, C, H, W) for Upsample2x, then back
             h = h.permute(0, 3, 1, 2)              # (B, C, H, W)
             h = self.up_samples[up_level](h)        # (B, C, H*2, W*2)
             h = h.permute(0, 2, 3, 1)              # (B, H*2, W*2, C)

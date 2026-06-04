@@ -57,6 +57,19 @@ class DecoderConfig:
 
 
 @dataclass
+class MoEConfig:
+    """Mixture of Experts configuration for decoder down-path."""
+    num_experts: int = 4          # Real experts (not counting zero expert)
+    include_zero_expert: bool = True
+    gate_hidden_dim: int = 64
+    prob_threshold: float = 0.05
+    routing_mode: str = "soft"    # "soft" | "top_prob" | "top_k"
+    top_k: int = 2
+    moe_conv: bool = True
+    moe_dit: bool = True
+
+
+@dataclass
 class MultiScaleDecoderConfig:
     """U-Net multi-scale OT-CFM velocity network configuration.
 
@@ -74,6 +87,7 @@ class MultiScaleDecoderConfig:
     window_size: int = 4
     latent_spatial_size: int = 8
     latent_dim: int = 256
+    moe: MoEConfig | None = None
 
 
 @dataclass
