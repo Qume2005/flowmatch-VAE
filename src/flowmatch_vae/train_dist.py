@@ -44,12 +44,6 @@ def train_func(config: dict):
     # ---- Data ----
     transform = get_transforms(tc.image_size)
 
-    # rank 0 先下载，其他 worker 等下载完再建 dataset
-    if rank == 0:
-        CelebA(root=tc.data_path, split="train", target_type=["attr"],
-                transform=transform, download=True)
-    torch.distributed.barrier()
-
     dataset = CelebA(root=tc.data_path, split="train", target_type=["attr"],
                      transform=transform, download=False)
 
@@ -162,7 +156,21 @@ def _save_samples(model: FlowMatchVAE, cfg: Config, epoch: int, device):
     model.train()
 
 
+def prepare_data(cfg: Config):
+    """在 Ray 启动前下载并验证数据集。"""
+    tc = cfg.train
+    print(f"Checking dataset at {tc.data_path}...")
+    CelebA(
+        root=tc.data_path, split="train", target_type=["attr"],
+        transform=get_transforms(tc.image_size), download=True,
+    )
+    print("Dataset ready.")
+
+
 def main():
+    cfg = Config()
+    prepare_data(cfg)
+
     ray.init()
 
     trainer = TorchTrainer(
