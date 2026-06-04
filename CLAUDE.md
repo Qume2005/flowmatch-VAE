@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Variational Autoencoder with a **multi-scale SwiGLU conv encoder** and **OT-CFM (Optimal Transport Conditional Flow Matching) decoder** for 64×64 image generation on CelebA. The latent space is spatial: `z ∈ (B, 8, 8, 256)` — a 2D feature map preserving spatial structure.
+Variational Autoencoder with a **multi-scale SwiGLU conv encoder** and **U-Net multi-scale OT-CFM decoder** for 64×64 image generation on CelebA. The latent space is spatial: `z ∈ (B, 8, 8, 256)` — a 2D feature map preserving spatial structure.
 
 ## Commands
 
@@ -36,6 +36,7 @@ python -m flowmatch_vae.sample checkpoints/checkpoint_epoch200.pt --mode reconst
 ### Data Flow
 
 ```
+=== ENCODER ===
 Image (B,3,64,64)
   -> Stem Conv1x1(3->256) + RMSNorm2d
   -> Stage0: 3x SwiGLUConv(d in {1,2,3,4}, k=3) + AttnPool2x2 -> 32x32
@@ -45,52 +46,68 @@ Image (B,3,64,64)
   -> Stage4: 1x SwiGLUConv(k=1) + AttnPool2x2 -> 2x2
   -> Stage5: 1x SwiGLUConv(k=1) + AttnPool2x2 -> 1x1
   -> Collect all scales (1365 tokens) + scale_embed + 2D RoPE
-  -> FusionAttention (linear self-attn, 8 heads) -> extract 8x8 tokens
-  -> mu_head, logvar_head -> mu, logvar (B,8,8,256)
-  -> reparameterize -> z (B,8,8,256)
-  -> noise x0 ~ N(0,1), sample t ~ U(0,1), x_t = (1-t)*x0 + t*x
-  -> PatchEmbed(4x4) + nearest-upsample z -> 12x CrossAttnAdaLNSwinBlock(x_t, z, t_emb)
-  -> RMSNorm -> Linear -> pixel_shuffle -> v_pred (B,3,64,64)
-  -> FM loss: MSE(v_pred, x-x0) + KL divergence loss
+  -> FusionAttention -> per-scale tokens dict + mu, logvar (B,8,8,256)
+
+=== DECODER (U-Net) ===
+x_t (B,3,64,64) + z (B,8,8,256) + per_scale_tokens from encoder
+
+Down path (AttnPool2x2 between levels):
+  Level 0 (16x16): DiT_block x 2 [self-attn + cross-attn -> VAE scale 1]
+  Level 1 (8x8):   DiT_block x 2 [self-attn + cross-attn -> VAE scale 2 = z]
+  Level 2 (4x4):   DiT_block x 1 [self-attn + cross-attn -> VAE scale 3]
+  Level 3 (2x2):   DiT_block x 1 [self-attn + cross-attn -> VAE scale 4]
+  Level 4 (1x1):   DiT_block x 1 [self-attn + cross-attn -> VAE scale 5]
+
+Up path (Upsample2x between levels, skip connections via addition):
+  Level 3 (2x2):   DiT_block x 1 + skip from down
+  Level 2 (4x4):   DiT_block x 1 + skip from down
+  Level 1 (8x8):   DiT_block x 2 + skip from down
+  Level 0 (16x16): DiT_block x 2 + skip from down
+
+Output: RMSNorm -> Linear -> pixel_shuffle -> v_pred (B,3,64,64)
+
+=== GENERATION ===
+z ~ N(0,I) -> MultiScalePrior predicts scales {1,3,4,5} -> decoder uses predicted tokens
 ```
 
 ### Key Design Decisions
 
 - **OT-CFM loss**: Straight-line interpolation between noise and data; velocity target is `x1 - x0`. Generation uses 8-step Euler integration from noise.
-- **Multi-Scale SwiGLU Conv Encoder**: Progressive 2x2 attention-pooling from 64x64 to 1x1. Each stage has multi-channel SwiGLU-gated depthwise convolutions with dilation. All 6 scales fused via linear self-attention with 2D RoPE. Different stages can have different numbers of conv layers and dilation rates.
-- **AttnPool2x2**: Learned 2x2 pooling via softmax attention (inspired by mHC H_pre). alpha*phi(x_norm) + bias -> softmax -> weighted sum. Guarantees weights sum to 1. Alpha initialised small for near-uniform start.
+- **Multi-Scale SwiGLU Conv Encoder**: Progressive 2x2 attention-pooling from 64x64 to 1x1. Each stage has multi-channel SwiGLU-gated depthwise convolutions with dilation. All 6 scales fused via linear self-attention with 2D RoPE. Encoder returns per-scale tokens dict for decoder cross-attention.
+- **U-Net Multi-Scale Decoder**: Down path uses AttnPool2x2, up path uses Upsample2x (nearest + SwiGLUConv). Skip connections via addition. Each level cross-attends to the VAE encoder's corresponding scale features. Goes coarse-to-fine naturally.
+- **MultiScalePrior**: Predicts multi-scale features from z for generation. ConvTranspose (upsample larger scales) + Conv (pool smaller scales) + SwiGLUConv. Trained with L2 auxiliary loss. Training randomly picks encoder features or prior predictions (50/50) to bridge train/test gap.
+- **AttnPool2x2**: Learned 2x2 pooling via softmax attention (inspired by mHC H_pre). alpha*phi(x_norm) + bias -> softmax -> weighted sum. Guarantees weights sum to 1.
 - **1/7 kernel constraint**: Dilation rates chosen so effective RF <= sqrt(H*W)/7. At 64x64: dilations (1,2,3,4) -> RF (3,5,7,9). At smaller scales: dilation=1 or pointwise (kernel=1).
 - **2D RoPE**: Split head dimension in half: first half encodes y-position, second half encodes x-position. Applied in FusionAttention for position-aware cross-scale attention.
-- **Kimi Linear Attention (KDA)**: Bidirectional linear attention replacing softmax. L2-normalised Q/K, channel-wise forget gate (alpha), delta-rule learning rate (beta), depthwise conv on Q/K/V, sigmoid output gating. O(n·d²) instead of O(n²·d). See arXiv:2510.26692.
-- **mHC residual connections**: Expanded n-stream residual (n=4) with Sinkhorn-Knopp doubly-stochastic H_res, sigmoid-constrained H_pre/H_post. The stream expands C→4C internally, contracted back by averaging. See arXiv:2512.24880.
-- **SwiGLU FFN**: `w_down(SiLU(w_gate(x)) * DWConv_multi(w_up(x)))` — multi-scale dilated depthwise convolutions replace the pure-linear up-path. Parallel DWConv branches at dilation rates (1,2,4) capture multi-scale context. Kernel size 3, effective RF ≤ spatial_size/7.
-- **SwiGLU-gated convolutions everywhere**: PatchEmbed uses depthwise strided conv + SwiGLU pointwise projection. KimiLinearAttention Q/K/V use multi-scale dilated DWConv with SwiGLU gating (dilation rates 1,2).
+- **z IS scale 2**: The VAE bottleneck z (8x8) is naturally one of the encoder's multi-scale levels. No separate z cross-attention needed — decoder level 1 directly queries z.
+- **Kimi Linear Attention (KDA)**: Bidirectional linear attention replacing softmax. O(n·d²) complexity enables cross-attention to 1024 tokens (32x32 scale) efficiently.
+- **mHC residual connections**: Expanded n-stream residual (n=4) with Sinkhorn-Knopp doubly-stochastic H_res. See arXiv:2512.24880.
+- **SwiGLU FFN**: `w_down(SiLU(w_gate(x)) * w_up(x))`. SwiGLU-gated depthwise convolutions used throughout encoder and Upsample2x.
 - **RMSNorm everywhere**: No LayerNorm, no BatchNorm. AdaLN blocks use `elementwise_affine=False` since scale/shift come from the conditioning MLP.
-- **AdaLN conditioning**: Time `t` injected via adaptive RMSNorm modulation (DiT-style) — the time embedding predicts scale/shift/gate parameters for each sub-layer.
-- **Pixel shuffle output**: Decoder reconstructs via `F.pixel_shuffle` rather than transposed convolutions.
-- **Muon + SGD optimizer**: Muon (Newton-Schulz orthogonalised momentum) for 2D weight matrices, SGD (momentum=0.9) for biases/norms/embeddings. See arXiv:2502.16982.
+- **AdaLN conditioning**: Time `t` injected via adaptive RMSNorm modulation (DiT-style).
+- **Muon + SGD optimizer**: Muon (Newton-Schulz orthogonalised momentum) for 2D weight matrices, SGD (momentum=0.9) for biases/norms/embeddings.
 
 ### Source Layout (`src/flowmatch_vae/`)
 
 | File | Role |
 |------|------|
-| `config.py` | Dataclass configs: `MultiScaleEncoderConfig`, `EncoderConfig`, `DecoderConfig`, `mHCConfig`, `TrainConfig` composed into `Config` |
-| `models/conv_encoder.py` | Multi-scale SwiGLU conv encoder: `SwiGLUConv`, `AttnPool2x2`, `FusionAttention`, `apply_2d_rope`, `MultiScaleConvEncoder` |
-| `models/swin.py` | Core blocks — `RMSNorm`, `KimiLinearAttention`, `KimiLinearCrossAttention`, `SwiGLUFFN`, `mHCConnection` (read/write API), `SwinBlock`, `AdaLNSwinBlock`, `CrossAttnAdaLNSwinBlock`, `PatchEmbed`, `PatchMerge` |
-| `models/encoder.py` | `SwinEncoder` — two-stage Swin-T, outputs `mu` and `logvar`. Accepts `mhc_cfg` kwarg. |
-| `models/decoder.py` | `FlowDecoder` — OT-CFM velocity network with sinusoidal time embedding + 12 cross-attention blocks. Accepts `mhc_cfg` kwarg. |
-| `models/vae.py` | `FlowMatchVAE` — combines encoder/decoder, implements `compute_loss()`, `sample()`, `reconstruct()` |
-| `optimizers.py` | `Muon` optimizer (Newton-Schulz, Nesterov momentum, bf16 iteration) + `split_param_groups()` helper |
-| `data/celeba.py` | CelebA loading with in-memory caching (`cache_dataset()` pre-loads into `TensorDataset` for zero-IO training) |
-| `train.py` | Single-GPU training loop with Muon + SGD |
-| `train_dist.py` | 8-GPU distributed training via Ray Actors + PyTorch native DDP (NCCL) |
+| `config.py` | Dataclass configs: `MultiScaleEncoderConfig`, `MultiScaleDecoderConfig`, `mHCConfig`, `TrainConfig` composed into `Config` |
+| `models/conv_encoder.py` | Multi-scale encoder + prior: `SwiGLUConv`, `AttnPool2x2`, `Upsample2x`, `FusionAttention`, `MultiScalePrior`, `MultiScaleConvEncoder` |
+| `models/swin.py` | Core blocks — `RMSNorm`, `KimiLinearAttention`, `KimiLinearCrossAttention`, `SwiGLUFFN`, `mHCConnection`, `CrossAttnAdaLNSwinBlock`, `PatchEmbed` |
+| `models/encoder.py` | Legacy `SwinEncoder` (kept for backward compatibility) |
+| `models/decoder.py` | `FlowDecoder` — U-Net multi-scale OT-CFM velocity network with down/up paths and per-level cross-attention |
+| `models/vae.py` | `FlowMatchVAE` — encoder + decoder + prior, `compute_loss()` (FM + KL + prior), `sample()`, `reconstruct()` |
+| `optimizers.py` | `Muon` optimizer + `split_param_groups()` |
+| `data/celeba.py` | CelebA with in-memory caching |
+| `train.py` | Single-GPU training loop |
+| `train_dist.py` | 8-GPU distributed training via Ray + DDP |
 
-### Block Variants (in `swin.py` and `conv_encoder.py`)
+### Block Variants
 
-- **`MultiScaleConvEncoder`** (conv_encoder.py): Encoder. 6 stages of SwiGLUConv + AttnPool2x2, collecting features at all scales, fused via FusionAttention with 2D RoPE. Outputs mu and logvar at 8x8 spatial resolution.
-- **`SwinBlock`** (swin.py): Legacy encoder block. KimiLinear windowed attn + SwiGLU FFN, both with mHC residual connections. Expands stream to nC internally, contracts back to C.
-- **`AdaLNSwinBlock`**: Decoder block with AdaLN modulation. Condition → 6 params (s1,sh1,g1, s2,sh2,g2). RMSNorm with `elementwise_affine=False`.
-- **`CrossAttnAdaLNSwinBlock`**: Full decoder block. Self-attn (windowed KimiLinear) + cross-attn (KimiLinearCrossAttention, x→z) + SwiGLU FFN. Condition → 9 params (3× scale/shift/gate). Three independent mHC connections.
+- **`CrossAttnAdaLNSwinBlock`** (swin.py): DiT block used at every decoder level. Self-attn + cross-attn + SwiGLU FFN, all with mHC residual. AdaLN time conditioning → 9 params.
+- **`MultiScaleConvEncoder`** (conv_encoder.py): 6 stages SwiGLUConv + AttnPool2x2, FusionAttention fusion, returns `(mu, logvar, per_scale_tokens)`.
+- **`MultiScalePrior`** (conv_encoder.py): z → predicts scales {1,3,4,5}. ConvTranspose up + Conv down + SwiGLUConv.
+- **`Upsample2x`** (conv_encoder.py): Nearest upsample 2× + SwiGLUConv refinement.
 
 ### mHC Connection API
 

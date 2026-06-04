@@ -174,18 +174,26 @@ class FlowDecoder(nn.Module):
         t_emb = self.time_embed(t)
 
         # === Down path ===
+        # h is (B, H, W, C) from PatchEmbed; DiT blocks use same format.
+        # AttnPool2x2 expects (B, C, H, W), so convert before/after pool.
         skips: list[torch.Tensor] = []
+        spatial_h = h.shape[1]
+        spatial_w = h.shape[2]
         for level, blocks in enumerate(self.down_blocks):
             vae_scale = self.vae_scale_map[level]
             vae_toks = self._get_vae_tokens(scale_tokens, vae_scale, z, B)
 
             for block in blocks:
-                h = block(h, t_emb, vae_toks)
+                h = block(h, t_emb, vae_toks)  # (B, H, W, C)
 
             skips.append(h)
 
             if level < len(self.down_pools):
-                h = self.down_pools[level](h)  # spatial halved
+                h = h.permute(0, 3, 1, 2)          # (B, C, H, W)
+                h = self.down_pools[level](h)        # (B, C, H/2, W/2)
+                h = h.permute(0, 2, 3, 1)           # (B, H/2, W/2, C)
+                spatial_h //= 2
+                spatial_w //= 2
 
         # === Up path ===
         # skips has n_levels entries: [L0(16x16), L1(8x8), L2(4x4), L3(2x2), L4(1x1)]
@@ -195,8 +203,10 @@ class FlowDecoder(nn.Module):
             down_level = len(self.down_blocks) - 2 - up_level  # 3, 2, 1, 0
             vae_scale = self.vae_scale_map[down_level]
 
-            # Upsample
-            h = self.up_samples[up_level](h)  # spatial doubled
+            # Upsample: convert to (B, C, H, W) for Upsample2x, then back
+            h = h.permute(0, 3, 1, 2)              # (B, C, H, W)
+            h = self.up_samples[up_level](h)        # (B, C, H*2, W*2)
+            h = h.permute(0, 2, 3, 1)              # (B, H*2, W*2, C)
 
             # Skip connection (addition)
             h = h + skips[down_level]

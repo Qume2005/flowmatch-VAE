@@ -3,11 +3,14 @@
 Key changes from the baseline:
 - **Kimi Linear Attention** (KDA) replaces standard softmax window attention.
   Channel-wise gated delta attention with L2-normalised Q/K, output gating,
-  and short depthwise convolutions (arXiv:2510.26692).
+  and multi-scale dilated SwiGLU-gated depthwise convolutions (arXiv:2510.26692).
 - **mHC** (Manifold-Constrained Hyper-Connections) replaces standard residual
   connections.  Doubly-stochastic Sinkhorn-Knopp projection on H_res,
   sigmoid-constrained H_pre / H_post, n-stream expansion (arXiv:2512.24880).
-- **SwiGLU FFN** replaces standard GELU MLP.
+- **SwiGLU FFN** with multi-scale dilated depthwise convolutions replaces
+  the pure-linear variant.  Parallel DWConv branches at different dilation
+  rates capture multi-scale spatial context.
+- **SwiGLU-gated PatchEmbed** replaces plain Conv2d patch projection.
 - **RMSNorm** everywhere — no LayerNorm, no BatchNorm.
 - **Swish (SiLU)** everywhere — no GELU, no ReLU.
 """
@@ -141,10 +144,27 @@ class KimiLinearAttention(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
 
-        # Short depthwise convolutions (kernel=3, padding=1)
-        self.dw_conv_q = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
-        self.dw_conv_k = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
-        self.dw_conv_v = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        # Multi-scale dilated depthwise convolutions for Q, K, V (SwiGLU-gated)
+        # dilation_rates chosen so effective RF ≤ window_size/7
+        # For window_size=4: max dilation ~1, so use (1,2)
+        # For larger windows the same rates still provide multi-scale context
+        dilation_rates = (1, 2)
+        self.dw_conv_q = nn.ModuleList([
+            nn.Conv1d(dim, dim, kernel_size=3, padding=d, dilation=d, groups=dim)
+            for d in dilation_rates
+        ])
+        self.dw_conv_k = nn.ModuleList([
+            nn.Conv1d(dim, dim, kernel_size=3, padding=d, dilation=d, groups=dim)
+            for d in dilation_rates
+        ])
+        self.dw_conv_v = nn.ModuleList([
+            nn.Conv1d(dim, dim, kernel_size=3, padding=d, dilation=d, groups=dim)
+            for d in dilation_rates
+        ])
+        # SwiGLU gating projections for conv branches
+        self.conv_gate_q = nn.Linear(dim, dim, bias=False)
+        self.conv_gate_k = nn.Linear(dim, dim, bias=False)
+        self.conv_gate_v = nn.Linear(dim, dim, bias=False)
 
         # Channel-wise forget gate: low-rank projection
         self.alpha_up = nn.Linear(dim, dim, bias=False)
@@ -161,12 +181,14 @@ class KimiLinearAttention(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        for m in (self.q_proj, self.k_proj, self.v_proj, self.out_proj):
+        for m in (self.q_proj, self.k_proj, self.v_proj, self.out_proj,
+                  self.conv_gate_q, self.conv_gate_k, self.conv_gate_v):
             nn.init.xavier_uniform_(m.weight)
-        for m in (self.dw_conv_q, self.dw_conv_k, self.dw_conv_v):
-            nn.init.kaiming_uniform_(m.weight, nonlinearity="linear")
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+        for branch_list in (self.dw_conv_q, self.dw_conv_k, self.dw_conv_v):
+            for m in branch_list:
+                nn.init.kaiming_uniform_(m.weight, nonlinearity="linear")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
@@ -182,10 +204,24 @@ class KimiLinearAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # Short depthwise conv + Swish
-        q = F.silu(self.dw_conv_q(q.transpose(1, 2))).transpose(1, 2)
-        k = F.silu(self.dw_conv_k(k.transpose(1, 2))).transpose(1, 2)
-        v = F.silu(self.dw_conv_v(v.transpose(1, 2))).transpose(1, 2)
+        # Multi-scale dilated depthwise conv with SwiGLU gating:
+        #   gate = SiLU(w_gate(x))  [linear path]
+        #   conv = sum(SiLU(DWConv_d(x_t)))  [multi-scale conv path]
+        #   output = gate * conv
+        def _ms_swiglu_conv(
+            x_seq: torch.Tensor,
+            conv_branches: nn.ModuleList,
+            gate_proj: nn.Linear,
+        ) -> torch.Tensor:
+            gate = F.silu(gate_proj(x_seq))               # (B_, N, C)
+            x_t = x_seq.transpose(1, 2)                    # (B_, C, N)
+            conv_out = sum(F.silu(branch(x_t)) for branch in conv_branches)
+            conv_out = conv_out.transpose(1, 2)            # (B_, N, C)
+            return gate * conv_out
+
+        q = _ms_swiglu_conv(q, self.dw_conv_q, self.conv_gate_q)
+        k = _ms_swiglu_conv(k, self.dw_conv_k, self.conv_gate_k)
+        v = _ms_swiglu_conv(v, self.dw_conv_v, self.conv_gate_v)
 
         # L2 normalise Q and K
         q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
@@ -288,24 +324,64 @@ class KimiLinearCrossAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SwiGLUFFN(nn.Module):
-    """SwiGLU feed-forward network.
+    """SwiGLU FFN with multi-scale dilated depthwise convolutions.
 
-    hidden_mult = 8/3 ≈ 2.67 matches the parameter count of a standard 4× MLP
-    when rounded to 256-multiples.
+    Replaces the pure-linear SwiGLU with a convolutional variant:
+      w_down( SiLU(w_gate(x)) * DWConv_multi(w_up(x)) )
+
+    The DWConv_multi branch uses parallel depthwise convolutions at different
+    dilation rates, capturing multi-scale spatial context.  Each branch output
+    is summed (like an Inception-style multi-scale module).
+
+    Kernel size is always 3.  Effective receptive fields = 1 + 2·dilation.
+    dilation_rates should be chosen so that effective RF ≤ spatial_size / 7.
+
+    Args:
+        dim: Token dimension.
+        hidden_mult: Hidden dimension multiplier (rounded to 256-multiples).
+        out_features: Output dimension (defaults to dim).
+        dilation_rates: Tuple of dilation rates for parallel depthwise branches.
     """
 
-    def __init__(self, dim: int, hidden_mult: float = 8.0 / 3.0, out_features: int | None = None):
+    def __init__(
+        self,
+        dim: int,
+        hidden_mult: float = 8.0 / 3.0,
+        out_features: int | None = None,
+        dilation_rates: tuple[int, ...] = (1, 2, 4),
+    ):
         super().__init__()
         hidden = int(dim * hidden_mult)
         hidden = ((hidden + 255) // 256) * 256
         out_features = out_features or dim
+        self.dilation_rates = dilation_rates
 
         self.w_gate = nn.Linear(dim, hidden, bias=False)
         self.w_up = nn.Linear(dim, hidden, bias=False)
+
+        # Multi-scale dilated depthwise convolutions on the up-projected path.
+        self.dw_branches = nn.ModuleList([
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=d, dilation=d, groups=hidden)
+            for d in dilation_rates
+        ])
+
         self.w_down = nn.Linear(hidden, out_features, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+        # x: (..., C) — may be (B, H, W, C) spatial or (B, N, C) sequential
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])               # (P, C) where P = B*H*W or B*N
+
+        gate = F.silu(self.w_gate(x_2d))                   # (P, hidden)
+        up = self.w_up(x_2d)                                # (P, hidden)
+
+        # Multi-scale dilated depthwise conv: (1, hidden, P) → per-channel along sequence
+        up_t = up.t().unsqueeze(0)                          # (1, hidden, P)
+        up_conv = sum(F.silu(branch(up_t)) for branch in self.dw_branches)
+        up_conv = up_conv.squeeze(0).t()                    # (P, hidden)
+
+        out = self.w_down(gate * up_conv)                   # (P, out_features)
+        return out.reshape(*orig_shape[:-1], out.shape[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -604,16 +680,18 @@ class AdaLNSwinBlock(nn.Module):
         layer_in, ctx = self.mhc_attn.read(xs)
         normed = self.norm1(layer_in) * (1 + s1) + sh1
 
-        shifted = normed
-        if self.shift_size > 0:
+        ws = min(self.window_size, H, W)
+        do_shift = self.shift_size > 0 and ws < H and ws < W
+        if do_shift:
             shifted = torch.roll(normed, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted = normed
 
-        ws = self.window_size
         x_win = window_partition(shifted, ws).view(-1, ws * ws, C)
         attn_out = self.attn(x_win)
         attn_out = window_reverse(attn_out.view(-1, ws, ws, C), ws, H, W)
 
-        if self.shift_size > 0:
+        if do_shift:
             attn_out = torch.roll(attn_out, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
         attn_out = g1 * self.drop_path(attn_out)
@@ -633,14 +711,27 @@ class AdaLNSwinBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class PatchEmbed(nn.Module):
-    """Image → patch embedding via Conv2d."""
+    """Image → patch embedding via SwiGLU-gated convolution.
+
+    Uses a depthwise strided conv (spatial downsample) followed by a SwiGLU
+    pointwise projection:  SiLU(w_gate(x)) * w_up(x).
+    """
 
     def __init__(self, in_channels: int = 3, patch_size: int = 4, embed_dim: int = 128):
         super().__init__()
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # Depthwise strided conv for spatial downsampling
+        self.dw_proj = nn.Conv2d(
+            in_channels, in_channels,
+            kernel_size=patch_size, stride=patch_size,
+            groups=in_channels,
+        )
+        # SwiGLU pointwise: gate + up paths
+        self.w_gate = nn.Conv2d(in_channels, embed_dim, kernel_size=1, bias=False)
+        self.w_up = nn.Conv2d(in_channels, embed_dim, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x).permute(0, 2, 3, 1)
+        x = self.dw_proj(x)                              # (B, in_ch, H/ps, W/ps)
+        return (F.silu(self.w_gate(x)) * self.w_up(x)).permute(0, 2, 3, 1)
 
 
 class PatchMerge(nn.Module):
@@ -744,16 +835,18 @@ class CrossAttnAdaLNSwinBlock(nn.Module):
         layer_in, ctx = self.mhc_self.read(xs)
         normed = self.norm1(layer_in) * (1 + s1) + sh1
 
-        shifted = normed
-        if self.shift_size > 0:
+        ws = min(self.window_size, H, W)
+        do_shift = self.shift_size > 0 and ws < H and ws < W
+        if do_shift:
             shifted = torch.roll(normed, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted = normed
 
-        ws = self.window_size
         x_win = window_partition(shifted, ws).view(-1, ws * ws, C)
         attn_out = self.attn(x_win)
         attn_out = window_reverse(attn_out.view(-1, ws, ws, C), ws, H, W)
 
-        if self.shift_size > 0:
+        if do_shift:
             attn_out = torch.roll(attn_out, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
 
         self_out = g1 * self.drop_path(attn_out)
