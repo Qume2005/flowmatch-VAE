@@ -995,11 +995,12 @@ class CrossAttnAdaLNSwinBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 def fix_depthwise_grad_strides(module: nn.Module) -> None:
-    """Register post-accumulate grad hooks to make depthwise conv gradients contiguous.
+    """Register grad hooks to make depthwise conv gradients contiguous.
 
     Depthwise Conv1d/Conv2d (groups == out_channels) produce non-contiguous
-    gradients, which triggers a DDP warning.  This hook makes the gradient
-    contiguous in-place after accumulation, so DDP bucket views match.
+    gradients, which triggers a DDP warning.  Using register_hook (not the
+    post-accumulate variant) ensures contiguity before DDP's reducer inspects
+    the gradient during the backward pass.
     """
     for name, child in module.named_modules():
         if isinstance(child, (nn.Conv1d, nn.Conv2d)) and child.groups == child.out_channels:
@@ -1011,4 +1012,4 @@ def fix_depthwise_grad_strides(module: nn.Module) -> None:
                             return grad.contiguous()
                         return grad
 
-                    p.register_post_accumulate_grad_hook(_make_contiguous)
+                    p.register_hook(_make_contiguous)
