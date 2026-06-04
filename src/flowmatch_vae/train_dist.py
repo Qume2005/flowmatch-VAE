@@ -176,7 +176,8 @@ def main():
 
     prepare_data(cfg)
 
-    ray.init()
+    import logging
+    ray.init(logging_level=logging.ERROR, log_to_driver=False)
 
     trainer = TorchTrainer(
         train_loop_per_worker=train_func,
