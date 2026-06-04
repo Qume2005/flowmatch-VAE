@@ -18,6 +18,7 @@ from flowmatch_vae.config import (
 from flowmatch_vae.models.conv_encoder import MultiScaleConvEncoder, MultiScalePrior
 from flowmatch_vae.models.encoder import SwinEncoder
 from flowmatch_vae.models.decoder import FlowDecoder
+from flowmatch_vae.models.swin import fix_depthwise_grad_strides
 
 
 class FlowMatchVAE(nn.Module):
@@ -98,6 +99,9 @@ class FlowMatchVAE(nn.Module):
 
         # Prior network (only used with multi-scale encoder)
         self.prior = prior
+
+        # Fix DDP grad strides for depthwise convolutions
+        fix_depthwise_grad_strides(self)
 
     def encode(self, x: torch.Tensor):
         """Encode image to latent space.

@@ -13,7 +13,6 @@ import os
 import socket
 import tempfile
 import time
-import warnings
 
 import ray
 import torch
@@ -126,10 +125,7 @@ class TrainingWorker:
 
                 muon_opt.zero_grad()
                 sgd_opt.zero_grad()
-                # Depthwise Conv1d grad strides mismatch is harmless — suppress
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message="Grad strides do not match")
-                    losses["loss"].backward()
+                losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 muon_opt.step()
                 sgd_opt.step()

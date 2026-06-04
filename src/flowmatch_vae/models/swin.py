@@ -988,3 +988,27 @@ class CrossAttnAdaLNSwinBlock(nn.Module):
         xs = self.mhc_ffn.write(xs, ffn_out, ctx)
 
         return _contract_stream(xs, self.n)
+
+
+# ---------------------------------------------------------------------------
+# Utility: fix DDP grad strides for depthwise convolutions
+# ---------------------------------------------------------------------------
+
+def fix_depthwise_grad_strides(module: nn.Module) -> None:
+    """Register post-accumulate grad hooks to make depthwise conv gradients contiguous.
+
+    Depthwise Conv1d/Conv2d (groups == out_channels) produce non-contiguous
+    gradients, which triggers a DDP warning.  This hook makes the gradient
+    contiguous in-place after accumulation, so DDP bucket views match.
+    """
+    for name, child in module.named_modules():
+        if isinstance(child, (nn.Conv1d, nn.Conv2d)) and child.groups == child.out_channels:
+            for p in child.parameters():
+                if p.requires_grad:
+
+                    def _make_contiguous(grad: torch.Tensor) -> torch.Tensor:
+                        if not grad.is_contiguous():
+                            return grad.contiguous()
+                        return grad
+
+                    p.register_post_accumulate_grad_hook(_make_contiguous)
