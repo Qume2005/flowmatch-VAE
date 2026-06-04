@@ -44,13 +44,16 @@ class TrainingWorker:
     def setup(self, rank: int, world_size: int, master_addr: str, master_port: int):
         self.rank = rank
         self.world_size = world_size
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+        self.device = torch.device(f"cuda:{local_rank}")
         dist.init_process_group(
             backend="nccl",
             init_method=f"tcp://{master_addr}:{master_port}",
             rank=rank,
             world_size=world_size,
+            device_id=self.device,
         )
-        self.device = torch.device("cuda")
 
     def train(self, cfg_dict: dict) -> dict:
         cfg = Config()
@@ -73,7 +76,11 @@ class TrainingWorker:
 
         # ---- Model (DDP) ----
         model = FlowMatchVAE(cfg).to(self.device)
-        model = DDP(model, device_ids=[self.device], output_device=self.device)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=self.device,
+        )
 
         if self.rank == 0:
             n_params = sum(p.numel() for p in model.parameters())
@@ -250,6 +257,7 @@ def prepare_data(cfg: Config):
 
 
 def main():
+    os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
     ray.init()
 
     cfg = Config()

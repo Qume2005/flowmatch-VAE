@@ -72,11 +72,11 @@ class SwiGLUConv(nn.Module):
             self.gate_dw = nn.Conv2d(
                 in_channels, in_channels, kernel_size,
                 padding=pad, dilation=dilation, groups=in_channels,
-            )
+            ).to(memory_format=torch.channels_last)
             self.up_dw = nn.Conv2d(
                 in_channels, in_channels, kernel_size,
                 padding=pad, dilation=dilation, groups=in_channels,
-            )
+            ).to(memory_format=torch.channels_last)
             self.proj = nn.Conv2d(in_channels, out_channels, 1)
             self._use_conv = True
 
