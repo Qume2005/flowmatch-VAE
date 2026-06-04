@@ -62,6 +62,20 @@ class FlowDecoder(nn.Module):
                  shared_convs: nn.ModuleList | None = None, shared_pool: AttnPool2x2 | None = None,
                  encoder_dilations: tuple[int, ...] | None = None):
         super().__init__()
+        # Normalize legacy DecoderConfig -> MultiScaleDecoderConfig
+        from flowmatch_vae.config import DecoderConfig, MultiScaleDecoderConfig
+        if isinstance(cfg, DecoderConfig) and not isinstance(cfg, MultiScaleDecoderConfig):
+            cfg = MultiScaleDecoderConfig(
+                out_channels=cfg.out_channels,
+                patch_size=cfg.patch_size,
+                embed_dim=cfg.embed_dim,
+                blocks_down=(cfg.depth // 2, cfg.depth // 2),
+                blocks_up=(cfg.depth // 4, cfg.depth // 4),
+                num_heads=cfg.num_heads,
+                window_size=cfg.window_size,
+                latent_spatial_size=cfg.latent_spatial_size,
+                latent_dim=cfg.latent_dim,
+            )
         self.cfg = cfg
         C = cfg.embed_dim
         ps = cfg.patch_size

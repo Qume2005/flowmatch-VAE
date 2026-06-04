@@ -56,13 +56,52 @@ def _restore_nested_config(section_cfg, section_dict):
             setattr(section_cfg, f.name, value)
 
 
+def _detect_config_type(section_dict: dict, new_cls, old_cls):
+    """Detect whether a section dict corresponds to *new_cls* or *old_cls*.
+
+    Compares the set of dict keys against the fields of each dataclass.
+    Returns the class whose field names best match the dict keys.
+    """
+    from dataclasses import fields as dc_fields
+    dict_keys = set(section_dict.keys())
+    new_keys = {f.name for f in dc_fields(new_cls)}
+    old_keys = {f.name for f in dc_fields(old_cls)}
+    # Prefer the class whose keys are a superset of (or equal to) the dict keys
+    if dict_keys <= new_keys:
+        return new_cls
+    if dict_keys <= old_keys:
+        return old_cls
+    # Fallback: whichever has more overlap
+    new_overlap = len(dict_keys & new_keys)
+    old_overlap = len(dict_keys & old_keys)
+    return new_cls if new_overlap >= old_overlap else old_cls
+
+
 def load_model(checkpoint_path: str, device: str = "cpu") -> tuple[FlowMatchVAE, Config]:
+    from flowmatch_vae.config import EncoderConfig, DecoderConfig
+
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     # Config stored as dict to support weights_only=True
     cfg_dict = ckpt["config"]
     if isinstance(cfg_dict, dict):
         cfg = Config()
-        for section_name in ("encoder", "decoder", "mhc", "train"):
+
+        # Detect and instantiate the correct config type for each section.
+        # _restore_nested_config handles converting nested dicts (e.g. MoEConfig)
+        # back into proper dataclass instances.
+        section_map = {
+            "encoder": (type(cfg.encoder), EncoderConfig),
+            "decoder": (type(cfg.decoder), DecoderConfig),
+        }
+        for section_name, (new_cls, old_cls) in section_map.items():
+            section_dict = cfg_dict.get(section_name, {})
+            detected_cls = _detect_config_type(section_dict, new_cls, old_cls)
+            section_cfg = detected_cls()
+            _restore_nested_config(section_cfg, section_dict)
+            setattr(cfg, section_name, section_cfg)
+
+        # Restore remaining sections (mhc, train) — no ambiguity in type
+        for section_name in ("mhc", "train"):
             section_cfg = getattr(cfg, section_name)
             section_dict = cfg_dict.get(section_name, {})
             _restore_nested_config(section_cfg, section_dict)
